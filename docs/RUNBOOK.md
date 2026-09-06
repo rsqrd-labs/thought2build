@@ -1060,7 +1060,7 @@ mix them). The constants are `BILLING_DEAD_LETTER_KEY` in
     automatic path that recovers a missed grant (`order_created` /
     `payment_link.paid`) — the signed `checkout_ref`+nonce row is the proof.
   - **Lane 2 — provider re-read:** iterates the configured providers, paging each
-    provider's live packs from its own cursor and re-reading via
+    provider's active, consumed, expired, refunded, and disputed packs from its own cursor and re-reading via
     `lemonsqueezy_service.get_order` / `razorpay_service.get_payment`, each under
     its own `*_RECONCILE_MAX_CALLS_PER_RUN` budget and its own 429 back-off; a
     missed refund/fraud applies the **same** `apply_refund_reversal` and
@@ -1070,10 +1070,14 @@ mix them). The constants are `BILLING_DEAD_LETTER_KEY` in
   - **Lane 3 — hygiene:** expires checkout attempts past `expires_at` and emits a
     stale-attempt operator count, labelled by each attempt row's own provider (a
     batch may mix providers).
-- **Reconcile never auto-grants.** It only re-enqueues signed inbox rows and
-  revokes on existing packs — there is no code path that invents a first grant
-  from order listing/amount/email. An unprovable paid checkout is settled via the
-  admin-correction path (§9.5).
+- **Razorpay recovery:** each run also reads a bounded page of unresolved,
+  recorded Payment Links (including locally expired/failed attempts). Only an
+  authenticated link/payment pair matching the original reference, owner, nonce,
+  environment, amount, and currency can grant. The shared webhook transaction
+  applies known refunds/disputes before credits become available. Recovery scans
+  the last `RAZORPAY_RECONCILE_LOOKBACK_DAYS` (default 180 days), up to
+  `RAZORPAY_RECOVERY_ATTEMPTS_PER_RUN` (default 50) each run. Older unresolved
+  attempts remain stored for explicit support recovery.
 
 ### 9.5 Admin-Correction Runbook (`POST /billing/admin/correction`)
 
@@ -1084,7 +1088,7 @@ could not settle (e.g. `BillingUnprovablePaidCheckout`).
   (comma-separated). An empty allowlist authorises nobody — the path is closed by
   default. There is no role column in V1.
 - **Request body:** `provider` (`lemonsqueezy` | `razorpay`), `provider_order_id`
-  (the Razorpay `pay_…` payment id, per D7), `target_user_id`, `credits`,
+  (the Razorpay `pay_…` payment id), `checkout_ref` (required for Razorpay), `target_user_id`, `credits`,
   `price_cents`, `currency`, a `reason` justification, and an `evidence_url` (the
   support ticket or the active provider's dashboard order). The `evidence_url` is
   **required**. `expires_at` is derived from the named provider's
@@ -1093,12 +1097,13 @@ could not settle (e.g. `BillingUnprovablePaidCheckout`).
   `(provider, provider_order_id)`. A repeat call returns `applied: false`,
   `credits_granted: 0` — never a second grant. Every call is audited
   (`billing_admin_corrections` row + `thought2build_billing_admin_correction_total`).
-- **Procedure:** confirm the order is genuinely paid in the active provider's
-  dashboard (Lemon order, or the Razorpay payment `pay_…`) and that no pack
-  already exists for the order id; capture the evidence URL; issue the
-  correction; verify the user's balance moved by exactly `credits`. On Razorpay
-  this is also the settlement path for a **dispute/chargeback loss**, which lane 2
-  cannot detect (§9.9).
+- **Procedure:** locate the original checkout and capture a support evidence URL.
+  The Razorpay correction endpoint independently fetches the recorded Payment
+  Link and payment, validates its proof and original economics, binds the pack,
+  and completes the original checkout atomically. Its expiry is anchored to the
+  payment timestamp. Verify usable credits and debt recovery, which may differ
+  from the purchased amount. A correction is a positive grant, never a tool to
+  settle a refund or dispute loss. Replay the signed reversal event instead.
 
 ### 9.6 Optional Dedicated Billing Worker (Scale-Out)
 
@@ -1175,9 +1180,9 @@ same `billing_process_webhook` job on the same worker, `billing:deadletter`
 - Create webhooks in **both test and live modes** (Razorpay webhooks are
   **per-mode** — test and live are configured separately, each with its own
   secret), URL `https://<api-host>/billing/webhook/razorpay`, events
-  `payment_link.paid` + `refund.processed` (optionally subscribe
-  `payment.dispute.*` / `payment.failed` / `payment_link.expired` for log-level
-  visibility — they hit the acknowledged-ignored path, zero grant impact).
+  `payment_link.paid`, `refund.processed`, and all six dispute events:
+  `payment.dispute.created`, `.under_review`, `.action_required`, `.lost`,
+  `.won`, and `.closed`. Failed/expired link events remain informational.
 - Config: `RAZORPAY_KEY_ID` / `_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`,
   HTTPS `RAZORPAY_SUCCESS_URL`, and the economics
   (`RAZORPAY_PRICE_CENTS` in **paise** — 154900 = ₹1549 — `_CURRENCY`,
@@ -1189,20 +1194,11 @@ same `billing_process_webhook` job on the same worker, `billing:deadletter`
   environment, round-tripped through `notes.environment` and enforced on every
   `payment_link.paid`).
 
-**Provider-switch procedure (Lemon ⇄ Razorpay):**
-
-1. Set `PAYMENT_PROVIDER=<target>` (and `PAYMENTS_ENABLED=true`), restart. Read at
-   request time — a flag change + restart, no code change.
-2. Checkout and `GET /billing/package` immediately reflect the new provider's
-   economics and `enabled` flag; the frontend gates the Buy button on it.
-3. **The retired provider keeps settling (D3):** its webhook route stays live and
-   `refund.processed` / `order_refunded` for old orders still revoke credits and
-   create debt. Do **not** blank the old provider's webhook secret during the
-   settlement tail — leave it configured so late refunds/disputes verify.
-4. A user who redirected to the old provider's hosted page *just before* the
-   switch and returns with `?checkout_ref=` still gets credited — the webhook
-   grants regardless of the active flag and `PaymentStatusPanel` polls regardless
-   of `enabled` (kill-switch-mid-flight is a pinned frontend test).
+**Razorpay-only checkout:** set `PAYMENT_PROVIDER=razorpay`; other values cannot
+create new purchases and fail production startup. `PAYMENTS_ENABLED=false`
+stops new checkout while existing payment, refund, and dispute settlement
+continues. Retain legacy provider secrets only if historical purchases require
+settlement. Apply migration 0046 before starting the updated API and workers.
 
 **Webhook-secret rotation (two-secret window, per-mode).** Identical mechanism to
 §9.8 but with `RAZORPAY_WEBHOOK_SECRET` / `RAZORPAY_WEBHOOK_SECRET_PREV` (the
@@ -1223,14 +1219,20 @@ across the `rzp_test_`↔`rzp_live_` boundary changes the environment guard** �
 server then only accepts webhooks whose `notes.environment` matches, so flip keys
 and the active webhook mode together.
 
-**Dispute/chargeback caveat (weaker than Lemon).** Razorpay payments expose **no**
-fraud/dispute status, so **reconcile lane 2 cannot detect a chargeback** — unlike
-Lemon, where a `fraudulent` `order_refunded` (and lane-2 re-read) auto-revokes.
-On an individual (non-MoR) account the money liability is the account holder's.
-Mitigation: subscribe `payment.dispute.*` for log-level visibility
-(`billing.webhook_ignored_event`); settle a dispute loss manually via the
-dashboard + admin-correction (§9.5, `provider=razorpay`). No automated dispute
-reversal in v1.
+**Dispute settlement:** signed dispute events are persisted by dispute and payment
+id. Open disputes are recorded without withholding credits; losses revoke credit
+value and create recoverable debt when needed. Newer wins release the reversal
+with original pack expiry and donor provenance. Older events and regressions to
+open do not undo a terminal decision; conflicting terminal events at the same
+provider timestamp require an authenticated dispute read. Cash refunds and lost
+disputes use the greater cumulative reversal, capped at the purchase, so overlapping
+claims cannot revoke the same entitlement twice. A closed event only independently
+revokes its `amount_deducted`; cash refunds remain authoritative separately.
+
+Payment re-reads do not discover wholly missing dispute events. Monitor the
+Razorpay dispute dashboard and webhook delivery failures; redeliver missing
+signed events and check the inbox/dead-letter queue. Do not use positive admin
+corrections to reverse money. See [launch verification](PAYMENT_LAUNCH_VERIFICATION.md).
 
 **Dead-letter / reconcile / pending-sweep** are all provider-neutral and cover
 Razorpay by construction — §9.3, §9.4 apply unchanged (the dead-letter record's

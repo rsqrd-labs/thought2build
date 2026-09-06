@@ -1,23 +1,9 @@
 """Razorpay integration service for Thought2Build credit purchases.
 
-Issue #44 — Step 3 (Plan §4). The INR gateway alternative to Lemon Squeezy,
-selected by the ``PAYMENT_PROVIDER`` flag. This module is a thin, pure wrapper
-over the existing ``httpx`` dependency — **no Razorpay SDK** (D5: the official
-python SDK is sync and would block the event loop) — exposing exactly two
-operations:
-
-  * :meth:`RazorpayService.create_payment_link` — mint a hosted Payment Link
-    (D2) for an already-committed ``billing_checkout_attempts`` row (the
-    attempt-first flow). Thought2Build is the authority for the attempt; the link
-    is created against the attempt's economics **snapshot** (``amount`` =
-    ``attempt.price_cents``, integer paise — D8) so an in-flight config price
-    change can never alter what the user is charged, and ``accept_partial`` is
-    off so grant validation can compare the full amount (D10).
-  * :meth:`RazorpayService.get_payment` — re-read a single payment Thought2Build
-    already has by id, for reconcile lane 2. It is **never** used to discover
-    or prove a payment — the signed ``payment_link.paid`` webhook is the sole
-    grant authority (D4). It surfaces a 429 / ``Retry-After`` to the caller so
-    lane 2 backs off rather than hammering the provider.
+Razorpay is the gateway for new credit purchases. Hosted Payment Links use the
+committed checkout attempt's economics and proof. Authenticated payment reads
+recover missing refunds; authenticated reads of a recorded Payment Link and its
+payment can recover a missing first grant through the shared settlement worker.
 
 Security contract (same as the Lemon mirror):
   * The key pair and the hosted link URL are **never logged**. Failure logs
@@ -334,6 +320,91 @@ class RazorpayService:
 
         return self._parse_payment_response(response, payment_id)
 
+    async def _get_entity(
+        self,
+        path: str,
+        *,
+        client: httpx.AsyncClient | None = None,
+    ) -> dict:
+        """Authenticated read; callers persist only allow-listed fields."""
+        async with self._client_ctx(client) as http:
+            try:
+                response = await http.get(path, auth=self._auth())
+            except httpx.RequestError as exc:
+                raise RazorpayError("Razorpay settlement read failed") from exc
+        if response.status_code == 429:
+            raise RazorpayRateLimitError(_retry_after_seconds(response))
+        if response.status_code != 200:
+            raise RazorpayError(
+                f"Razorpay settlement read failed (HTTP {response.status_code})"
+            )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RazorpayError("Malformed Razorpay settlement response") from exc
+        if not isinstance(data, dict):
+            raise RazorpayError("Malformed Razorpay settlement response")
+        return data
+
+    async def get_dispute(self, dispute_id: str) -> dict:
+        data = await self._get_entity(f"/v1/disputes/{dispute_id}")
+        if data.get("id") != dispute_id or data.get("status") not in {
+            "open",
+            "under_review",
+            "action_required",
+            "lost",
+            "won",
+            "closed",
+        }:
+            raise RazorpayError("Dispute identity or status mismatch")
+        return data
+
+    async def get_paid_checkout(
+        self,
+        attempt: "BillingCheckoutAttempt",
+        *,
+        client: httpx.AsyncClient | None = None,
+    ) -> dict | None:
+        """Recover payment ONLY through this attempt's recorded Payment Link.
+
+        The authenticated link provides captured payment membership, and its
+        notes prove the original nonce/owner. A fresh payment read supplies the
+        current cumulative refund state, so recovery cannot spend refunded money.
+        The shared grant validator checks the economics and ownership again.
+        """
+        link_id = attempt.provider_checkout_id
+        if not link_id:
+            return None
+        link = await self._get_entity(f"/v1/payment_links/{link_id}", client=client)
+        if link.get("id") != link_id or link.get("reference_id") != str(attempt.id):
+            raise RazorpayError("Payment Link identity mismatch")
+        if link.get("status") != "paid":
+            return None
+        payments = link.get("payments")
+        if not isinstance(payments, list) or len(payments) != 1:
+            raise RazorpayError("Expected one full Payment Link payment")
+        member = payments[0]
+        payment_id = member.get("payment_id") if isinstance(member, dict) else None
+        if not isinstance(payment_id, str) or not payment_id.startswith("pay_"):
+            raise RazorpayError("Missing Payment Link payment identity")
+        payment = await self._get_entity(f"/v1/payments/{payment_id}", client=client)
+        if payment.get("id") != payment_id:
+            raise RazorpayError("Payment identity mismatch")
+        if link.get("order_id") and payment.get("order_id") != link["order_id"]:
+            raise RazorpayError("Payment does not belong to the Payment Link order")
+        if payment.get("status") not in ("captured", "refunded"):
+            raise RazorpayError("Payment has not been captured")
+        # Same normalization/proof checks as signed webhook ingress. Local import
+        # avoids a router/service import cycle; raw notes never reach the inbox.
+        from routers.billing import _normalize_razorpay_link_paid
+
+        return _normalize_razorpay_link_paid(
+            {
+                "payment_link": {"entity": link},
+                "payment": {"entity": payment},
+            }
+        )
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -416,6 +487,8 @@ class RazorpayService:
         try:
             data = response.json()
             parsed_id = str(data["id"])
+            if parsed_id != payment_id:
+                raise ValueError("Payment identity mismatch")
         except (KeyError, TypeError, ValueError) as exc:
             logger.error("billing.razorpay_payment_malformed payment_id=%s", payment_id)
             raise RazorpayError(

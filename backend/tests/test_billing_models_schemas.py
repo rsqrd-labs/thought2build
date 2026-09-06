@@ -138,14 +138,14 @@ def test_checkout_response_checkout_ref_optional_then_set() -> None:
 
 
 def test_package_response_carries_currency() -> None:
-    """PackageResponse exposes currency (defaults USD)."""
+    """PackageResponse exposes currency (defaults INR)."""
     assert PackageResponse(credits=200, price_cents=900, validity_days=30).currency == (
-        "USD"
+        "INR"
     )
 
 
 def test_admin_correction_request_valid() -> None:
-    """A well-formed admin correction validates and defaults provider=lemonsqueezy."""
+    """A well-formed admin correction validates and defaults provider=razorpay."""
     req = AdminCorrectionRequest(
         provider_order_id="ord_123",
         target_user_id=uuid4(),
@@ -155,7 +155,7 @@ def test_admin_correction_request_valid() -> None:
         reason="Webhook never arrived; verified paid in Lemon dashboard.",
         evidence_url="https://app.lemonsqueezy.com/orders/123",
     )
-    assert req.provider == "lemonsqueezy"
+    assert req.provider == "razorpay"
     assert req.credits == 200
 
 

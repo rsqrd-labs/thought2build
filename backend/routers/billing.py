@@ -135,7 +135,13 @@ _LEMON_OBJECT_TYPE = "orders"
 # events subscribed for log-level visibility, …) is acknowledged without an
 # inbox row. The inbox object is the **payment** (``pay_…``) — the money object
 # refunds reference (D7) — hence object type "payments".
-_RAZORPAY_ACTIONABLE_EVENTS = frozenset({"payment_link.paid", "refund.processed"})
+_RAZORPAY_DISPUTE_EVENTS = frozenset(
+    f"payment.dispute.{state}"
+    for state in ("created", "under_review", "action_required", "lost", "won", "closed")
+)
+_RAZORPAY_ACTIONABLE_EVENTS = (
+    frozenset({"payment_link.paid", "refund.processed"}) | _RAZORPAY_DISPUTE_EVENTS
+)
 _RAZORPAY_OBJECT_TYPE = "payments"
 
 router = APIRouter(prefix="/billing", tags=["billing"])
@@ -444,9 +450,24 @@ async def _status_by_checkout_ref(
             detail="Checkout not found",
         )
 
+    await credit_service.get_balance(db, current_user.id)
+    await db.commit()
+    await credit_service.invalidate(current_user.id)
+    await db.refresh(pack)
+    settlement_status = pack.status
+    if pack.refunded_item_amount_cents_processed and pack.status not in (
+        "refunded",
+        "disputed",
+        "expired",
+    ):
+        settlement_status = "partially_refunded"
     return BillingStatusResponse(
         status="completed",
-        credits_added=pack.credits_purchased,
+        credits_added=pack.credits_remaining,
+        credits_purchased=pack.credits_purchased,
+        debt_recovered=pack.credits_debt_recovered,
+        credits_revoked=pack.credits_revoked,
+        settlement_status=settlement_status,
         expires_at=pack.expires_at,
     )
 
@@ -462,6 +483,9 @@ async def get_billing_history(
     the retained ``StripeCreditPack`` table. Includes every status so users see a
     complete audit trail of their purchases.
     """
+    await credit_service.get_balance(db, current_user.id)
+    await db.commit()
+    await credit_service.invalidate(current_user.id)
     result = await db.execute(
         select(BillingCreditPack)
         .where(BillingCreditPack.user_id == current_user.id)
@@ -501,6 +525,42 @@ async def admin_correction(
     """
     provider = body.provider
     order_id = body.provider_order_id
+    attempt = None
+    verified_payment = None
+    if provider == "razorpay":
+        if not body.checkout_ref:
+            raise HTTPException(
+                422, "Razorpay correction requires the original checkout_ref"
+            )
+        from services.billing_worker import _razorpay_link_paid_rejection
+        from services.razorpay_settlement import lock_payment
+
+        await lock_payment(db, order_id)
+        attempt = await db.scalar(
+            select(BillingCheckoutAttempt)
+            .where(
+                BillingCheckoutAttempt.checkout_ref == body.checkout_ref,
+                BillingCheckoutAttempt.user_id == body.target_user_id,
+                BillingCheckoutAttempt.provider == provider,
+            )
+            .with_for_update()
+        )
+        if attempt is None:
+            raise HTTPException(404, "Checkout not found")
+        try:
+            verified_payment = await razorpay_service.get_paid_checkout(attempt)
+        except (RazorpayError, HTTPException) as exc:
+            raise HTTPException(502, "Unable to verify the Razorpay payment") from exc
+        if (
+            verified_payment is None
+            or verified_payment["payment_id"] != order_id
+            or _razorpay_link_paid_rejection(
+                verified_payment, verified_payment["notes"], attempt
+            )
+            or (body.credits, body.price_cents, body.currency)
+            != (attempt.credits, attempt.price_cents, attempt.currency)
+        ):
+            raise HTTPException(409, "Payment does not match the original checkout")
 
     # Idempotency pre-check: a pack OR a prior correction for this exact order.
     existing_pack = await db.scalar(
@@ -516,6 +576,18 @@ async def admin_correction(
         )
     )
     if existing_pack is not None or existing_correction is not None:
+        if attempt is not None and existing_pack is not None:
+            pack_owner = await db.scalar(
+                select(BillingCreditPack.user_id).where(
+                    BillingCreditPack.id == existing_pack
+                )
+            )
+            if pack_owner != attempt.user_id:
+                raise HTTPException(409, "Payment already belongs to another account")
+            attempt.status = "completed"
+            attempt.provider_order_id = order_id
+            attempt.completed_at = attempt.completed_at or datetime.now(timezone.utc)
+            await db.commit()
         logger.info(
             "billing.admin_correction.noop provider=%s order_id=%s admin_user_id=%s",
             provider,
@@ -538,10 +610,19 @@ async def admin_correction(
 
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(days=_credit_validity_days_for(provider))
+    purchased_at = now
+    if attempt is not None:
+        captured_at = (verified_payment.get("payment") or {}).get("created_at")
+        if captured_at:
+            purchased_at = datetime.fromtimestamp(int(captured_at), tz=timezone.utc)
+        expires_at = purchased_at + timedelta(days=attempt.validity_days)
     pack = BillingCreditPack(
         user_id=body.target_user_id,
         provider=provider,
         provider_order_id=order_id,
+        provider_checkout_id=(
+            attempt.provider_checkout_id if attempt is not None else None
+        ),
         credits_purchased=body.credits,
         credits_remaining=body.credits,
         price_cents=body.price_cents,
@@ -549,7 +630,7 @@ async def admin_correction(
         paid_item_amount_cents=body.price_cents,
         provider_order_total_cents=body.price_cents,
         status="active",
-        purchased_at=now,
+        purchased_at=purchased_at,
         expires_at=expires_at,
     )
     db.add(pack)
@@ -610,6 +691,23 @@ async def admin_correction(
             evidence_url=str(body.evidence_url),
         )
     )
+    if attempt is not None:
+        from services.razorpay_settlement import known_refund_cents, settle_pack
+
+        attempt.status = "completed"
+        attempt.provider_order_id = order_id
+        attempt.completed_at = now
+        await db.flush()
+        settlement = await settle_pack(
+            db,
+            pack,
+            max(
+                int(
+                    (verified_payment.get("payment") or {}).get("amount_refunded") or 0
+                ),
+                await known_refund_cents(db, order_id),
+            ),
+        )
     try:
         await db.commit()
     except IntegrityError:
@@ -630,6 +728,8 @@ async def admin_correction(
         )
 
     await credit_service.invalidate(body.target_user_id)
+    if attempt is not None:
+        settlement.record()
     BILLING_ADMIN_CORRECTION.labels(provider=provider).inc()
     # Debt repaid out of this correction (granted − surplus). Emitted post-commit so
     # a failed outer commit can never leave an over-counted recovery metric.
@@ -1033,8 +1133,12 @@ async def razorpay_webhook(
     # the grant authority).
     if event_name == "payment_link.paid":
         normalized_payload = _normalize_razorpay_link_paid(entities)
-    else:
+    elif event_name == "refund.processed":
         normalized_payload = _normalize_razorpay_refund(entities)
+    else:
+        normalized_payload = _normalize_razorpay_dispute(
+            entities, event_name, payload.get("created_at")
+        )
 
     payment_id = normalized_payload["payment_id"]
 
@@ -1158,6 +1262,8 @@ def _razorpay_payment_block(payment: dict[str, Any]) -> dict[str, Any]:
         "method": payment.get("method"),
         "amount_refunded": payment.get("amount_refunded"),
         "refund_status": payment.get("refund_status"),
+        "created_at": payment.get("created_at"),
+        "order_id": payment.get("order_id"),
     }
 
 
@@ -1211,6 +1317,7 @@ def _normalize_razorpay_link_paid(entities: dict[str, Any]) -> dict[str, Any]:
             "amount": link.get("amount"),
             "currency": link.get("currency"),
             "status": link.get("status"),
+            "order_id": link.get("order_id"),
         },
         "payment": _razorpay_payment_block(payment),
         "refund": None,
@@ -1234,7 +1341,7 @@ def _normalize_razorpay_refund(entities: dict[str, Any]) -> dict[str, Any]:
 
     refund_id = refund.get("id")
     payment_id = refund.get("payment_id") or payment.get("id")
-    if not refund_id or not payment_id:
+    if not refund_id or not payment_id or payment.get("id") not in (None, payment_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing refund identity",
@@ -1274,4 +1381,47 @@ def _normalize_razorpay_refund(entities: dict[str, Any]) -> dict[str, Any]:
             "amount": refund.get("amount"),
         },
         "notes": _razorpay_notes_block(notes, nonce_hash),
+    }
+
+
+def _normalize_razorpay_dispute(
+    entities: dict[str, Any],
+    event_name: str,
+    created_at: object,
+) -> dict[str, Any]:
+    dispute = _razorpay_entity(entities, "dispute")
+    payment = _razorpay_entity(entities, "payment")
+    payment_id = dispute.get("payment_id")
+    if (
+        not dispute.get("id")
+        or not payment_id
+        or payment.get("id") not in (None, payment_id)
+    ):
+        raise HTTPException(400, "Missing or mismatched dispute identity")
+    try:
+        timestamp = int(created_at)
+        amount = int(dispute["amount"])
+        deducted = int(dispute.get("amount_deducted") or 0)
+        if timestamp <= 0 or amount < 0 or deducted < 0:
+            raise ValueError
+    except (TypeError, ValueError, KeyError) as exc:
+        raise HTTPException(400, "Malformed dispute economics or timestamp") from exc
+    state = event_name.removeprefix("payment.dispute.")
+    if state == "created":
+        state = "open"
+    if dispute.get("status") != state or not dispute.get("currency"):
+        raise HTTPException(400, "Mismatched dispute state or currency")
+    return {
+        "provider": "razorpay",
+        "event_name": event_name,
+        "payment_id": str(payment_id),
+        "event_created_at": timestamp,
+        "payment": _razorpay_payment_block(payment),
+        "dispute": {
+            "dispute_id": str(dispute["id"]),
+            "amount": amount,
+            "currency": str(dispute["currency"]),
+            "status": state,
+            "amount_deducted": deducted,
+        },
     }

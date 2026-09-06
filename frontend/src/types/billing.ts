@@ -25,6 +25,10 @@ export interface BillingStatusResponse {
   status: "pending" | "completed"
   credits_added: number
   expires_at: string | null
+  credits_purchased?: number
+  debt_recovered?: number
+  credits_revoked?: number
+  settlement_status?: "active" | "consumed" | "expired" | "refunded" | "partially_refunded" | "disputed"
 }
 
 export interface CheckoutResponse {

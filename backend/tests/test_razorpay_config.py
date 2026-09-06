@@ -70,7 +70,7 @@ def _valid_production(**overrides: object):
         "lemonsqueezy_test_mode": False,
         # Payment flags at their shipping defaults.
         "payments_enabled": False,
-        "payment_provider": "lemonsqueezy",
+        "payment_provider": "razorpay",
         # Complete LIVE Razorpay config (configured + passes the guard).
         "razorpay_key_id": "rzp_live_abc123",
         "razorpay_key_secret": "rzp-secret",
@@ -149,7 +149,7 @@ def _both_providers_configured(**overrides: object):
         "razorpay_key_id": "rzp_test_x",
         "razorpay_key_secret": "sec",
         "payments_enabled": True,
-        "payment_provider": "lemonsqueezy",
+        "payment_provider": "razorpay",
     }
     base.update(overrides)
     return [patch.object(config.settings, key, value) for key, value in base.items()]
@@ -165,11 +165,11 @@ def test_checkout_disabled_when_payments_flag_off() -> None:
         _undo(patches)
 
 
-def test_checkout_enabled_for_active_configured_lemon() -> None:
+def test_checkout_disabled_for_legacy_lemon() -> None:
     patches = _both_providers_configured(payment_provider="lemonsqueezy")
     _apply(patches)
     try:
-        assert config.settings.billing_checkout_enabled is True
+        assert config.settings.billing_checkout_enabled is False
     finally:
         _undo(patches)
 
@@ -230,7 +230,7 @@ def test_prod_guard_passes_with_complete_live_configs_payments_off() -> None:
         _undo(patches)
 
 
-@pytest.mark.parametrize("provider", ["lemonsqueezy", "razorpay"])
+@pytest.mark.parametrize("provider", ["razorpay"])
 def test_prod_guard_passes_with_payments_on_and_active_configured(
     provider: str,
 ) -> None:
@@ -314,7 +314,9 @@ def test_prod_guard_rejects_payments_on_with_unconfigured_active_provider(
     try:
         with pytest.raises(RuntimeError) as exc:
             config.validate_production_settings()
-        assert "PAYMENTS_ENABLED" in str(exc.value)
+        assert (
+            "PAYMENTS_ENABLED" if provider == "razorpay" else "PAYMENT_PROVIDER"
+        ) in str(exc.value)
         assert provider in str(exc.value)
     finally:
         _undo(patches)
@@ -421,7 +423,7 @@ def test_prod_guard_applies_to_configured_but_inactive_razorpay() -> None:
     """
     patches = _valid_production(
         payments_enabled=False,
-        payment_provider="lemonsqueezy",
+        payment_provider="razorpay",
         razorpay_webhook_secret="",
     )
     _apply(patches)

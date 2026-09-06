@@ -25,7 +25,7 @@ from services.pipeline.tech_safety import render_hard_denylist_prose
 # solely in the JSON's regex patterns. Keep this date in lockstep with the
 # JSON's own ``last_reviewed`` field (test_plan_prompt.py asserts they match);
 # re-reviewing one without the other is exactly the drift this fix closes.
-DENYLIST_LAST_REVIEWED = "2026-08-05"
+DENYLIST_LAST_REVIEWED = "2026-09-06"
 
 SYSTEM_PROMPT = f"""{ASDD_METHODOLOGY_OVERVIEW}
 
