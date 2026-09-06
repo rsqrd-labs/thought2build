@@ -304,22 +304,18 @@ async def test_credit_refund_restores_balance_and_creates_ledger(
 
 
 # ---------------------------------------------------------------------------
-# IT-4: get_balance — caches the DB value and returns it from Redis
+# IT-4: get_balance — returns authoritative DB state without publishing cache
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_get_balance_caches_and_returns_live_value(
+async def test_get_balance_returns_database_value_without_publishing_uncommitted_cache(
     db_engine,
     test_user: uuid.UUID,
     redis_client: Redis,
 ) -> None:
-    """IT-4 — get_balance() populates the Redis cache on first call.
-
-    On a cache miss, the balance is read from PostgreSQL and written to Redis
-    with a TTL.  The next call returns from the cache.  T-204 — HF-7.
-    """
+    """Read the database without publishing a transaction's uncommitted balance."""
     service = CreditService(redis_client=redis_client)
     factory = async_sessionmaker(db_engine, expire_on_commit=False)
     cache_key = f"credits:{test_user}"
@@ -335,10 +331,8 @@ async def test_get_balance_caches_and_returns_live_value(
         "T-204 — HF-7."
     )
 
-    # The balance must now be cached in Redis.
-    cached = await redis_client.get(cache_key)
-    assert cached is not None, (
-        f"get_balance() must populate Redis cache key {cache_key!r} after a "
-        "cache miss. T-204 — HF-7."
-    )
-    assert int(cached) == 100
+    # A read may sweep expiry in an uncommitted transaction. Never publish it.
+    assert await redis_client.get(cache_key) is None
+    await redis_client.set(cache_key, "999")
+    async with factory() as session:
+        assert await service.get_balance(session, test_user) == 100

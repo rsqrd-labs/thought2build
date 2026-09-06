@@ -163,7 +163,13 @@ _PACK_NOT_YET_GRANTED = "pack_not_yet_granted"
 # Postgres SQLSTATE for a FOR UPDATE NOWAIT that found the row already locked.
 _LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
 # Lane 2 sweeps packs that can still change refund/fraud state.
-_RECONCILE_LIVE_PACK_STATUSES = ("active", "refunded")
+_RECONCILE_LIVE_PACK_STATUSES = (
+    "active",
+    "consumed",
+    "expired",
+    "refunded",
+    "disputed",
+)
 # Lane 3 bounded expiry batch + the stale-attempt count that trips an operator alert.
 _RECONCILE_ATTEMPT_BATCH = 500
 _RECONCILE_STALE_ATTEMPT_ALERT = 200
@@ -489,9 +495,10 @@ async def billing_reconcile(ctx: dict) -> None:
     ``expires_at`` (metric labelled by each attempt's provider) and alert on stale
     buildup.
 
-    It **never** invents a first grant from order listing/email/receipt/order
-    number/amount/currency/time window/redirect — an unprovable paid checkout goes to
-    the admin-correction path (T-302), never an automatic grant.
+    Razorpay additionally recovers first grants through authenticated reads of
+    server-recorded Payment Links and their payments, validated by the same
+    ownership/economics proof as webhook settlement. It never matches by email
+    or amount alone.
     """
     async with AsyncSessionLocal() as lock_db:
         # 1. Claim the single-run lock on ALL cursor rows (ordered by provider ASC,
@@ -544,6 +551,17 @@ async def billing_reconcile(ctx: dict) -> None:
                 lane2_results[cursor.provider] = await _reconcile_lane2(
                     provider=cursor.provider, state=dict(cursor.state or {})
                 )
+                if cursor.provider == "razorpay":
+                    from services.razorpay_settlement import recover_attempts
+
+                    async def heartbeat():
+                        # Keep the reconciliation mutex transaction alive while
+                        # provider-bound reads run in separate short sessions.
+                        await lock_db.execute(select(1))
+
+                    await recover_attempts(
+                        lane2_results[cursor.provider].state, heartbeat=heartbeat
+                    )
             expired_attempts = await _reconcile_lane3()
         except Exception:
             await lock_db.rollback()  # discards last_run_started_at; cursors unchanged
@@ -607,6 +625,9 @@ async def _reconcile_lane2(*, provider: str, state: dict) -> _Lane2Result:
                     BillingCreditPack.status.in_(_RECONCILE_LIVE_PACK_STATUSES),
                     BillingCreditPack.provider_order_id.isnot(None),
                     BillingCreditPack.provider_order_id > last_id,
+                    BillingCreditPack.purchased_at
+                    >= _now()
+                    - timedelta(days=settings.razorpay_reconcile_lookback_days),
                 )
                 .order_by(BillingCreditPack.provider_order_id.asc())
                 .limit(max_calls)
@@ -678,12 +699,22 @@ async def _reconcile_apply_reversal(
     (a webhook the path missed).
     """
     async with AsyncSessionLocal() as db:
+        if provider == "razorpay":
+            from services.razorpay_settlement import lock_payment, settle_pack
+
+            await lock_payment(db, order_id)
         pack = await db.scalar(
             select(BillingCreditPack).where(BillingCreditPack.id == pack_id)
         )
         if pack is None:  # deleted between the candidate read and now — skip
             return False
         user_id = pack.user_id
+        if provider == "razorpay":
+            outcome = await settle_pack(db, pack, refunded_amount_cents)
+            await db.commit()
+            await credit_service.invalidate(user_id)
+            outcome.record(reconciled=True)
+            return bool(outcome.revoked or outcome.released)
         outcome = await credit_service.apply_refund_reversal(
             db,
             source_pack=pack,
@@ -923,6 +954,18 @@ async def purge_billing_events(ctx: dict) -> None:
                         .where(
                             BillingWebhookEvent.status == "processed",
                             BillingWebhookEvent.processed_at < cutoff,
+                            # A refund with no grant is durable reversal evidence.
+                            ~(
+                                (BillingWebhookEvent.provider == "razorpay")
+                                & (BillingWebhookEvent.event_name == "refund.processed")
+                                & ~select(BillingCreditPack.id)
+                                .where(
+                                    BillingCreditPack.provider == "razorpay",
+                                    BillingCreditPack.provider_order_id
+                                    == BillingWebhookEvent.provider_object_id,
+                                )
+                                .exists()
+                            ),
                         )
                         .limit(_PURGE_BATCH)
                     )
@@ -946,6 +989,15 @@ async def purge_billing_events(ctx: dict) -> None:
                                 ("expired", "failed", "completed")
                             ),
                             BillingCheckoutAttempt.created_at < cutoff,
+                            # Unresolved Razorpay attempts are payment evidence,
+                            # retained for provider recovery and support.
+                            ~(
+                                (BillingCheckoutAttempt.provider == "razorpay")
+                                & (BillingCheckoutAttempt.status != "completed")
+                                & BillingCheckoutAttempt.provider_checkout_id.isnot(
+                                    None
+                                )
+                            ),
                         )
                         .limit(_PURGE_BATCH)
                     )
@@ -1478,6 +1530,8 @@ def _razorpay_link_paid_rejection(
     """
     if attempt is None:
         return "attempt_not_found"
+    if attempt.provider != "razorpay":
+        return "provider_mismatch"
     # Ownership: notes.checkout_ref already loaded the attempt; corroborate the
     # nonce hash + user id. Never inferred from the payment id.
     raw_user_id = notes.get("user_id")
@@ -1489,7 +1543,9 @@ def _razorpay_link_paid_rejection(
         return "user_id_mismatch"
     if notes.get("checkout_nonce_hash_from_webhook") != attempt.checkout_nonce_hash:
         return "nonce_mismatch"
-    if attempt.status not in _GRANTABLE_ATTEMPT_STATUSES:
+    # Local checkout expiry stops new checkout initiation, not settlement of a
+    # captured payment. Expired/failed attempts still require all the proof below.
+    if attempt.status not in _GRANTABLE_ATTEMPT_STATUSES | {"expired", "failed"}:
         return "attempt_status_invalid"
     # Environment (test/live). Razorpay events carry no test_mode flag — the
     # round-tripped notes.environment is the guard (re-checked against live config
@@ -1503,11 +1559,26 @@ def _razorpay_link_paid_rejection(
     payment_currency = str(payment.get("currency") or "")
     if payment_currency.upper() != attempt.currency.upper():
         return "payment_currency_mismatch"
-    if payment.get("status") != "captured":
+    if payment.get("status") not in ("captured", "refunded"):
         return "payment_not_captured"
+    if payment.get("status") == "refunded" and (
+        (_coerce_int(payment.get("amount_refunded")) or 0) < attempt.price_cents
+    ):
+        return "refunded_payment_missing_total"
     # Link corroboration — accept_partial is off, so the full amount must match and
     # the link must be paid (the status_not_paid analogue).
     link = payload.get("payment_link") or {}
+    if link.get("reference_id") != str(attempt.id):
+        return "link_reference_mismatch"
+    if not link.get("payment_link_id"):
+        return "link_id_missing"
+    if (
+        attempt.provider_checkout_id
+        and link.get("payment_link_id") != attempt.provider_checkout_id
+    ):
+        return "link_id_mismatch"
+    if link.get("order_id") and payment.get("order_id") != link["order_id"]:
+        return "payment_order_mismatch"
     if _coerce_int(link.get("amount")) != attempt.price_cents:
         return "link_amount_mismatch"
     if link.get("status") != "paid":
@@ -1539,6 +1610,14 @@ async def handle_razorpay_link_paid(ctx: dict, webhook_event_id: str) -> None:
         payment_id = payload.get("payment_id")
         checkout_ref = notes.get("checkout_ref")
 
+        from services.razorpay_settlement import (
+            known_refund_cents,
+            lock_payment,
+            settle_pack,
+        )
+
+        await lock_payment(db, payment_id)
+
         # Locate the attempt by checkout_ref (the ownership key) and lock it.
         attempt: BillingCheckoutAttempt | None = None
         if checkout_ref:
@@ -1551,6 +1630,7 @@ async def handle_razorpay_link_paid(ctx: dict, webhook_event_id: str) -> None:
         reason = _razorpay_link_paid_rejection(payload, notes, attempt)
         if reason is not None:
             webhook.status = "processed"
+            webhook.last_error = reason
             webhook.processed_at = _now()
             await db.commit()
             # A rejected link the provider reports as *paid* is money we took but
@@ -1578,7 +1658,8 @@ async def handle_razorpay_link_paid(ctx: dict, webhook_event_id: str) -> None:
         price_cents = attempt.price_cents
         currency = attempt.currency
         validity_days = attempt.validity_days
-        provider_checkout_id = attempt.provider_checkout_id
+        provider_checkout_id = attempt.provider_checkout_id or link["payment_link_id"]
+        attempt.provider_checkout_id = provider_checkout_id
 
         # Lock the user row (canonical user→pack order shared with deduct/expire).
         user = await db.scalar(select(User).where(User.id == user_id).with_for_update())
@@ -1600,7 +1681,20 @@ async def handle_razorpay_link_paid(ctx: dict, webhook_event_id: str) -> None:
                 attempt.provider_order_id = payment_id
             webhook.status = "processed"
             webhook.processed_at = _now()
+            if existing.user_id != user_id or existing.provider_order_id != payment_id:
+                raise ValueError("Existing payment pack identity mismatch")
+            settlement = await settle_pack(
+                db,
+                existing,
+                max(
+                    _coerce_int((payload.get("payment") or {}).get("amount_refunded"))
+                    or 0,
+                    await known_refund_cents(db, payment_id),
+                ),
+            )
             await db.commit()
+            settlement.record()
+            await credit_service.invalidate(user_id)
             logger.info(
                 "billing.razorpay_link_paid.duplicate",
                 payment_id=payment_id,
@@ -1610,9 +1704,15 @@ async def handle_razorpay_link_paid(ctx: dict, webhook_event_id: str) -> None:
             return
 
         # Create the pack from the ATTEMPT SNAPSHOT (not live config — DC6). The
-        # normalized payload carries no order created_at, so the purchase (and expiry
-        # anchor) is stamped now — the webhook lands seconds after capture.
-        purchased_at = _now()
+        # payment timestamp anchors expiry even after a delayed webhook/recovery.
+        payment_created_at = _coerce_int(
+            (payload.get("payment") or {}).get("created_at")
+        )
+        purchased_at = (
+            datetime.fromtimestamp(payment_created_at, tz=UTC)
+            if payment_created_at
+            else _now()
+        )
         pack = BillingCreditPack(
             user_id=user_id,
             provider="razorpay",
@@ -1673,7 +1773,13 @@ async def handle_razorpay_link_paid(ctx: dict, webhook_event_id: str) -> None:
         attempt.provider_order_id = payment_id
         webhook.status = "processed"
         webhook.processed_at = _now()
+        refund_cents = max(
+            _coerce_int((payload.get("payment") or {}).get("amount_refunded")) or 0,
+            await known_refund_cents(db, payment_id),
+        )
+        settlement = await settle_pack(db, pack, refund_cents)
         await db.commit()
+        settlement.record()
 
     # Post-commit: evict the credit-balance cache, then record provider-labelled
     # telemetry; provider context also rides in the structured log.
@@ -1707,18 +1813,14 @@ async def handle_razorpay_link_paid(ctx: dict, webhook_event_id: str) -> None:
 # reversal as Lemon's `refunded_amount`, so partial + full refunds settle correctly
 # and re-deliveries are no-ops. Razorpay payments carry NO fraud/chargeback status
 # (disputes are separate entities — Plan §11), so reason is always "refund" and lane
-# 2 cannot detect a chargeback (a known, documented weakness vs the Lemon posture).
+# 2 reads refunds; the dedicated dispute handler settles chargebacks.
 
 
 async def handle_razorpay_refund(ctx: dict, webhook_event_id: str) -> None:
-    """Apply a Razorpay refund reversal exactly once, or route the no-pack branches.
+    """Settle cumulative refunds and retain unmatched signed reversal evidence.
 
-    Idempotent: the monotonic ``refunded_item_amount_cents_processed`` gate plus the
-    two-component ``refund:billing:{pack_id}:{cents}`` ledger reason make a replay of
-    the same or a lower refund level a no-op (durable processed state only). Shares
-    ``_refund_without_pack`` with Lemon — the refund's normalized payload carries the
-    payment entity's ``notes`` (checkout_ref + nonce hash + user_id), so the
-    park-and-retry proof branches work identically.
+    The payment lock serializes grant/refund/dispute transactions; settlement's
+    cumulative gate and the durable inbox make redelivery idempotent.
     """
     wid = UUID(webhook_event_id)
 
@@ -1731,9 +1833,11 @@ async def handle_razorpay_refund(ctx: dict, webhook_event_id: str) -> None:
         if webhook is None or webhook.status == "processed":
             return
         payload = webhook.normalized_payload or {}
-        notes = payload.get("notes") or {}
         payment_id = payload.get("payment_id")
         payment = payload.get("payment") or {}
+        from services.razorpay_settlement import lock_payment, settle_pack
+
+        await lock_payment(db, payment_id)
         # Cumulative refunded total on the payment entity (same semantics as Lemon's
         # refunded_amount). Coerced defensively: a refund arriving without a full
         # payment entity degrades to a monotonic no-op (0), and lane 2's get_payment
@@ -1760,43 +1864,130 @@ async def handle_razorpay_refund(ctx: dict, webhook_event_id: str) -> None:
         )
 
         if source_pack is None:
-            await _refund_without_pack(db, webhook, notes, payment_id)
+            # Keep proof even without link notes. A future grant consults these
+            # inbox rows while holding the same payment lock before committing.
+            webhook.status = "processed"
+            webhook.processed_at = _now()
+            webhook.last_error = "refund_waiting_for_payment_grant"
+            await db.commit()
             return
 
         user_id = source_pack.user_id
-        outcome = await credit_service.apply_refund_reversal(
-            db,
-            source_pack=source_pack,
-            provider_refunded_amount_cents=amount_refunded,
-            full_or_fraud=full_or_fraud,
-            reason_label=reason_label,
+        settlement = await settle_pack(
+            db, source_pack, payment_amount if full_or_fraud else amount_refunded
         )
         webhook.status = "processed"
         webhook.processed_at = _now()
         await db.commit()
+        settlement.record()
 
     # Post-commit: evict the credit-balance cache, then record telemetry.
     await credit_service.invalidate(user_id)
-    if outcome.credits_revoked > 0:
-        BILLING_CREDITS_REVOKED.labels(provider="razorpay", reason=reason_label).inc(
-            outcome.credits_revoked
-        )
-    if outcome.debt_created > 0:
-        BILLING_CREDIT_DEBT_CREATED.labels(
-            provider="razorpay", reason=reason_label
-        ).inc(outcome.debt_created)
     logger.info(
         "billing.razorpay_refund.processed",
         provider="razorpay",
         payment_id=payment_id,
         user_id=str(user_id),
         reason=reason_label,
-        new_refunded_item_cents=outcome.new_refunded_item_cents,
-        credits_revoked=outcome.credits_revoked,
-        immediate_revoke=outcome.immediate_revoke,
-        debt_created=outcome.debt_created,
-        applied=outcome.applied,
+        refunded_cents=amount_refunded,
     )
+
+
+async def handle_razorpay_dispute(ctx: dict, webhook_event_id: str) -> None:
+    from models import BillingDispute
+    from services.razorpay_settlement import lock_payment, settle_pack
+
+    async with AsyncSessionLocal() as db:
+        webhook = await db.scalar(
+            select(BillingWebhookEvent)
+            .where(
+                BillingWebhookEvent.id == UUID(webhook_event_id),
+            )
+            .with_for_update()
+        )
+        if webhook is None or webhook.status == "processed":
+            return
+        payload = webhook.normalized_payload
+        payment_id = payload["payment_id"]
+        await lock_payment(db, payment_id)
+        dispute = payload["dispute"]
+        row = await db.get(BillingDispute, dispute["dispute_id"])
+        timestamp = payload["event_created_at"]
+        state = dispute["status"]
+        if state == "closed" and dispute["amount_deducted"] > 0:
+            state = "closed_loss"
+        if row and (
+            row.provider_payment_id != payment_id or row.currency != dispute["currency"]
+        ):
+            raise ValueError("Dispute payment or currency changed")
+        terminal = {"lost", "won", "closed", "closed_loss"}
+        stale = row and (
+            timestamp < row.event_created_at
+            or (row.status in terminal and state not in terminal)
+            or (
+                timestamp == row.event_created_at
+                and row.status in terminal
+                and row.status == state
+            )
+        )
+        if (
+            row
+            and not stale
+            and timestamp == row.event_created_at
+            and row.status in terminal
+            and state in terminal
+        ):
+            current = await razorpay_service.get_dispute(dispute["dispute_id"])
+            if (
+                current.get("payment_id") != payment_id
+                or current.get("currency") != dispute["currency"]
+            ):
+                raise ValueError("Dispute API identity mismatch")
+            state = current["status"]
+            dispute = {
+                **dispute,
+                "amount": int(current["amount"]),
+                "amount_deducted": int(current.get("amount_deducted") or 0),
+            }
+            if state == "closed" and dispute["amount_deducted"] > 0:
+                state = "closed_loss"
+        settlement = None
+        if not stale:
+            if row is None:
+                row = BillingDispute(
+                    provider_dispute_id=dispute["dispute_id"],
+                    provider_payment_id=payment_id,
+                )
+                db.add(row)
+            row.amount_cents = (
+                dispute["amount_deducted"]
+                if state == "closed_loss"
+                else dispute["amount"]
+            )
+            row.currency = dispute["currency"]
+            row.status = state
+            row.event_created_at = timestamp
+            await db.flush()
+            pack = await db.scalar(
+                select(BillingCreditPack).where(
+                    BillingCreditPack.provider == "razorpay",
+                    BillingCreditPack.provider_order_id == payment_id,
+                )
+            )
+            if pack is not None:
+                if pack.currency != row.currency or row.amount_cents > pack.price_cents:
+                    raise ValueError("Dispute economics do not match payment")
+                settlement = await settle_pack(
+                    db,
+                    pack,
+                    int((payload.get("payment") or {}).get("amount_refunded") or 0),
+                )
+        webhook.status = "processed"
+        webhook.processed_at = _now()
+        await db.commit()
+    if settlement is not None:
+        settlement.record()
+        await credit_service.invalidate(pack.user_id)
 
 
 # Wire the handlers at import so they are present whenever the worker (or the dispatch
@@ -1808,3 +1999,14 @@ register_event_handler("lemonsqueezy", "order_created", handle_order_created)
 register_event_handler("lemonsqueezy", "order_refunded", handle_order_refunded)
 register_event_handler("razorpay", "payment_link.paid", handle_razorpay_link_paid)
 register_event_handler("razorpay", "refund.processed", handle_razorpay_refund)
+for _dispute_state in (
+    "created",
+    "under_review",
+    "action_required",
+    "lost",
+    "won",
+    "closed",
+):
+    register_event_handler(
+        "razorpay", f"payment.dispute.{_dispute_state}", handle_razorpay_dispute
+    )

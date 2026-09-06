@@ -42,13 +42,13 @@ class PackageResponse(BaseModel):
     validity_days: int = Field(
         ge=1, description="Days until the purchased pack expires"
     )
-    currency: str = Field(default="USD", description="ISO 4217 currency code")
+    currency: str = Field(default="INR", description="ISO 4217 currency code")
     enabled: bool = Field(
         default=True,
         description="True when POST /billing/checkout is available (issue #44)",
     )
     provider: str = Field(
-        default="lemonsqueezy",
+        default="razorpay",
         description="The active payment provider these economics belong to",
     )
 
@@ -77,7 +77,15 @@ class BillingStatusResponse(BaseModel):
     """
 
     status: Literal["pending", "completed"]
-    credits_added: int = Field(ge=0, description="Credits added by this purchase")
+    credits_added: int = Field(
+        ge=0, description="Currently usable credits from this purchase"
+    )
+    credits_purchased: int = Field(default=0, ge=0)
+    debt_recovered: int = Field(default=0, ge=0)
+    credits_revoked: int = Field(default=0, ge=0)
+    settlement_status: Literal[
+        "active", "consumed", "expired", "refunded", "partially_refunded", "disputed"
+    ] = "active"
     expires_at: datetime | None = Field(
         default=None, description="UTC expiry of the purchased pack"
     )
@@ -120,12 +128,15 @@ class AdminCorrectionRequest(BaseModel):
     """
 
     provider: Literal["lemonsqueezy", "stripe", "razorpay"] = Field(
-        default="lemonsqueezy", description="Billing provider of the corrected order"
+        default="razorpay", description="Billing provider of the corrected order"
     )
     provider_order_id: str = Field(
         min_length=1, description="Provider order id the correction settles"
     )
     target_user_id: UUID = Field(description="User to credit")
+    checkout_ref: str | None = Field(
+        default=None, description="Original checkout to settle; required for Razorpay"
+    )
     credits: int = Field(ge=1, description="Credits to grant")
     price_cents: int = Field(ge=1, description="Recorded order price in cents")
     currency: str = Field(min_length=1, description="ISO 4217 currency code")
