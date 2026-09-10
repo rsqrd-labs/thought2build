@@ -103,12 +103,48 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha || 'main' }}
           path: baseline
+      # Only a change to the prompt SOURCES can change what the pipeline
+      # generates, so only such a change needs live candidate evidence. This
+      # job's path filter is deliberately much wider than that (all of
+      # services/pipeline, services/llm, config.py, worker.py), which is the
+      # right question for "might this be prompt-affecting?" but the wrong
+      # trigger for a gate that hard-fails when provider secrets are absent: a PR
+      # touching only, say, the GitHub export orchestrator would then be blocked
+      # with no green path available to it.
+      #
+      # Compared with git against the PR's OWN base sha — not `origin/main`,
+      # which is not the base of a stacked PR — and only over tracked content, so
+      # a stray __pycache__ or other untracked artifact in either tree cannot
+      # silently flip this to "changed" and re-block the PR. Outside a PR
+      # (workflow_dispatch) there is no base to compare, so the gate runs: the
+      # safe default is evidence required, never evidence skipped.
+      - name: Detect prompt-source changes
+        id: prompts
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -z "$BASE_SHA" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "No PR base to compare against; requiring live candidate evidence."
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" 2>/dev/null || true
+          if git diff --quiet "$BASE_SHA" HEAD -- backend/prompts/; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Prompt sources identical to the PR base; skipping live generation."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Prompt sources changed; live candidate evidence is required."
+          fi
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        if: steps.prompts.outputs.changed == 'true'
         with:
           version: "0.11.8"
           enable-cache: true
-      - run: uv sync --project backend
+      - if: steps.prompts.outputs.changed == 'true'
+        run: uv sync --project backend
       - name: Generate both revisions with a bounded call count
+        if: steps.prompts.outputs.changed == 'true'
         # Missing keys fail this gate, including fork PRs. They require a trusted
         # evaluation run; absence of candidate evidence is never a quality pass.
         run: |
@@ -127,11 +163,12 @@ jobs:
               raise SystemExit(f'Generation failed: {failures}; inspect eval-results.')
           PY
       - name: Compare actual generated packages
+        if: steps.prompts.outputs.changed == 'true'
         run: >-
           uv run --project backend python harness/prompt_eval/compare_live.py
           --candidate eval-results/candidate.json --baseline eval-results/baseline.json
       - name: Preserve reviewable prompts, outputs, and provider attempts
-        if: always()
+        if: always() && steps.prompts.outputs.changed == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: generated-prompt-evidence
