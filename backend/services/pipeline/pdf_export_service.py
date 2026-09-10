@@ -119,7 +119,7 @@ class _NoNetworkFetch(Exception):
     """Raised when WeasyPrint tries to fetch a non-data URL during render."""
 
 
-def no_network_url_fetcher(url: str, **_: Any) -> dict[str, Any]:
+def no_network_url_fetcher(url: str, **_: Any) -> Any:
     """WeasyPrint url_fetcher that refuses every non-`data:` URL.
 
     Plan §18.4 requires that PDF rendering never trigger an outbound HTTP
@@ -131,13 +131,22 @@ def no_network_url_fetcher(url: str, **_: Any) -> dict[str, Any]:
     `no_network` marker — keep this token in the source for the harness
     contract test that scans for the no-network guard.
     """
-    if url.startswith("data:"):
-        # Delegate to WeasyPrint's default fetcher for data URLs only.
-        from weasyprint import default_url_fetcher
+    return _make_no_network_fetcher().fetch(url)
 
-        return default_url_fetcher(url)
-    logger.warning("pdf_export_blocked_url_fetch url=%s", url[:120])
-    raise _NoNetworkFetch(f"Network fetch blocked: {url[:120]}")
+
+def _make_no_network_fetcher():
+    # WeasyPrint 70 expects a URLFetcher instance, including its error policy.
+    # Keep the import lazy so non-PDF workers do not require native libraries.
+    from weasyprint import URLFetcher
+
+    class DataOnlyFetcher(URLFetcher):
+        def fetch(self, url, headers=None):
+            if not url.startswith("data:"):
+                logger.warning("pdf_export_blocked_url_fetch url=%s", url[:120])
+                raise _NoNetworkFetch(f"Network fetch blocked: {url[:120]}")
+            return super().fetch(url, headers)
+
+    return DataOnlyFetcher(allowed_protocols={"data"}, allow_redirects=False)
 
 
 # Boundary-local sanitization of the *rendered* HTML (audit F1 / plan §1.0).
@@ -357,7 +366,7 @@ def _render_pdf_sync(html_text: str) -> bytes:
 
     _start = time.perf_counter()
     pdf_bytes = HTML(string=html_text).write_pdf(
-        url_fetcher=no_network_url_fetcher,
+        url_fetcher=_make_no_network_fetcher(),
     )
     # Observe render duration in the Prometheus histogram.  T-194.
     PDF_EXPORT_DURATION.observe(time.perf_counter() - _start)
