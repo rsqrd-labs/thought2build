@@ -120,6 +120,9 @@ class StageGenerationRun(Base):
         ForeignKey("credit_ledger.id", ondelete="SET NULL"),
         nullable=True,
     )
+    input_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    input_identity: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    prepared_prompt: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     action: Mapped[str] = mapped_column(String, nullable=False)
     # The ordered chunk keys this run set out to produce. Stored rather than
     # recomputed so a later resume can tell "which sections are missing" without

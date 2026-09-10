@@ -2580,7 +2580,7 @@ async def test_generate_delivers_plan_before_technology_check() -> None:
     assert len(adapter.stream_calls) == 4
     assert len(adapter.complete_calls) == 0
     assert plan_stage.content == _UNSAFE_PLAN
-    assert plan_stage.quality_gate_status == "checking"
+    assert plan_stage.quality_gate_status == "blocked"
     assert _UNSAFE_PLAN in tokens
     assert any('"done": true' in token for token in tokens)
     mock_technology.assert_called_once()
@@ -3209,11 +3209,13 @@ async def test_generate_provider_error_refunds_credits() -> None:
 @pytest.mark.asyncio
 async def test_finalise_sets_next_stage_to_draft() -> None:
     workspace_id = uuid4()
-    spec_stage = _make_stage(workspace_id, "spec", status="draft", content="content")
+    spec_stage = _make_stage(workspace_id, "spec", status="draft", content=_VALID_SPEC)
     plan_stage = _make_stage(workspace_id, "plan", status="locked")
 
     svc = StageManager(redis_client=_FakeRedis())
-    db = _MultiQueryDB([spec_stage, plan_stage])
+    db = _MultiQueryDB(
+        [spec_stage, _make_workspace([spec_stage, plan_stage]), plan_stage]
+    )
     user = _make_user()
 
     await svc.finalise(spec_stage.id, user, db)
@@ -3276,7 +3278,7 @@ async def test_finalise_accepts_overridden_incomplete_output() -> None:
     spec_stage.quality_gate_failed_at = datetime.now(UTC)
 
     svc = StageManager(redis_client=_FakeRedis())
-    db = _MultiQueryDB([spec_stage])
+    db = _MultiQueryDB([spec_stage, _make_workspace([spec_stage]), []])
     user = _make_user()
 
     await svc.finalise(spec_stage.id, user, db)
@@ -3802,20 +3804,18 @@ async def test_acknowledge_stale_restores_finalised() -> None:
     # "Keep" on the staleness banner: a stale stage's content is accepted as-is
     # and restored to finalised, with no regenerate and no credit charge.
     workspace_id = uuid4()
-    tasks_stage = _make_stage(
-        workspace_id, "tasks", status="stale", content="kept content"
-    )
+    tasks_stage = _make_stage(workspace_id, "spec", status="stale", content=_VALID_SPEC)
     tasks_stage.finalised_at = None
 
     svc = StageManager(redis_client=_FakeRedis())
-    db = _MultiQueryDB([tasks_stage])
+    db = _MultiQueryDB([tasks_stage, _make_workspace([tasks_stage]), []])
     user = _make_user()
 
     updated = await svc.acknowledge_stale(tasks_stage.id, user, db)
 
     assert updated.status == "finalised"
     assert updated.finalised_at is not None
-    assert updated.content == "kept content"
+    assert updated.content == _VALID_SPEC
 
 
 @pytest.mark.asyncio
@@ -3827,11 +3827,11 @@ async def test_acknowledge_stale_middle_stage_leaves_downstream_finalised() -> N
     # Assert the contract directly: the downstream-stale cascade is never invoked.
     workspace_id = uuid4()
     plan_stage = _make_stage(
-        workspace_id, "plan", status="stale", content="plan content"
+        workspace_id, "plan", status="stale", content=_complete_plan(_SAFE_TECH_STACK)
     )
 
     svc = StageManager(redis_client=_FakeRedis())
-    db = _MultiQueryDB([plan_stage])
+    db = _MultiQueryDB([plan_stage, _make_workspace([plan_stage]), []])
     user = _make_user()
 
     with patch.object(svc, "_mark_downstream_stale", new_callable=AsyncMock) as cascade:
@@ -6105,7 +6105,7 @@ async def test_generate_section_gate_skips_critic_before_judge(monkeypatch) -> N
             return_value=("sys", "user", "0"),
         ),
         patch(
-            "services.pipeline.stage_manager.validate_sections_async",
+            "services.pipeline.stage_manager.validate_readiness_async",
             new_callable=AsyncMock,
             side_effect=raise_missing,
         ),
@@ -6283,3 +6283,108 @@ def test_every_stage_user_prompt_carries_the_strip_marker_once_after_fences() ->
         assert prompt.rfind(_WHOLE_DOC_VERIFY_MARKER) > prompt.rfind(
             "END_UNTRUSTED_CONTENT"
         ), module.__name__
+
+
+@pytest.mark.asyncio
+async def test_generation_uses_enqueued_snapshot_when_source_changes(monkeypatch):
+    """An edit after charge cannot change the prompt or old cache identity."""
+    from services.pipeline.input_manifest import source_identity
+
+    stage = _make_stage(status="draft")
+    workspace = _make_workspace([stage])
+    original = workspace.problem_statement
+    identity = source_identity(workspace, "spec")
+    user = _make_user()
+    deduction = CreditLedger(id=uuid4(), user_id=user.id, amount=-10, reason="generate")
+    db = _MultiQueryDB([stage, workspace, [], deduction])
+    svc = StageManager(redis_client=_FakeRedis())
+    adapter = _CompletionAwareAdapter([])
+
+    async def build(kind, frozen, *args, **kwargs):
+        assert frozen.problem_statement == original
+        workspace.problem_statement = "Changed product requirements after queueing"
+        return "sys", "user", "0"
+
+    with (
+        patch(
+            "services.pipeline.stage_manager.credit_service.deduct",
+            AsyncMock(return_value=deduction),
+        ),
+        patch(
+            "services.pipeline.stage_manager.build_prompt", AsyncMock(side_effect=build)
+        ),
+        patch("services.pipeline.stage_manager.get_llm", return_value=adapter),
+    ):
+        tokens = [token async for token in svc.generate(stage.id, user, db)]
+    assert any('"done": true' in token for token in tokens)
+    assert stage.source_identity == identity
+    run = db._generation_runs[-1]
+    assert run.input_snapshot["problem_statement"] == original
+    assert run.prepared_prompt["system"] == "sys"
+    assert run.prepared_prompt["system_hash"]
+    assert source_identity(workspace, "spec") != stage.source_identity
+
+
+@pytest.mark.asyncio
+async def test_finalise_detects_source_drift_before_unlocking_next_stage():
+    from services.pipeline.input_manifest import source_identity
+
+    stage = _make_stage(status="draft", content=_VALID_SPEC)
+    workspace = _make_workspace([stage])
+    stage.source_identity = source_identity(workspace, "spec")
+    workspace.problem_statement = "New product direction"
+    db = _MultiQueryDB([stage, workspace])
+    svc = StageManager(redis_client=_FakeRedis())
+    with pytest.raises(StageDependencyError, match="Source inputs changed"):
+        await svc.finalise(stage.id, _make_user(), db)
+    assert stage.status == "stale"
+    assert db._committed
+
+
+@pytest.mark.asyncio
+async def test_external_timeout_preserves_local_technology_blocker():
+    stage = _make_stage(stage_type="plan", status="draft", content=_UNSAFE_PLAN)
+    stage.current_version = 1
+    stage.quality_gate_status = "checking"
+    stage.quality_gate_version = 1
+    _MultiQueryDB([stage])
+    svc = StageManager(redis_client=_FakeRedis())
+    with patch(
+        "services.pipeline.stage_manager.analyze_technology_safety",
+        AsyncMock(side_effect=TimeoutError("external timeout")),
+    ):
+        await svc._dispatch_technology_check(
+            stage_id=stage.id,
+            version=1,
+            stage_type="plan",
+            content=_UNSAFE_PLAN,
+            deps={},
+        )
+    assert stage.quality_gate_status == "blocked"
+    codes = {item["code"] for item in stage.quality_gate_payload["findings"]}
+    assert "runtime_eol" in codes
+    assert "technology_safety_unverified" in codes
+
+
+@pytest.mark.asyncio
+async def test_manual_malformed_edit_cannot_finalise_without_override():
+    stage = _make_stage(status="draft", content="```\n## Overview\n```")
+    workspace = _make_workspace([stage])
+    db = _MultiQueryDB([stage, workspace])
+    svc = StageManager(redis_client=_FakeRedis())
+    with pytest.raises(QualityGateBlockedError):
+        await svc.finalise(stage.id, _make_user(), db)
+    assert stage.quality_gate_status == "blocked"
+    assert stage.quality_gate_version == stage.current_version
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_stale_cannot_finalise_malformed_draft():
+    stage = _make_stage(uuid4(), "spec", status="stale", content="unchecked draft")
+    db = _MultiQueryDB([stage, _make_workspace([stage]), []])
+    with pytest.raises(QualityGateBlockedError):
+        await StageManager(redis_client=_FakeRedis()).acknowledge_stale(
+            stage.id, _make_user(), db
+        )
+    assert stage.status == "stale"
+    assert stage.quality_gate_status == "blocked"

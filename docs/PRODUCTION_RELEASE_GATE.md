@@ -52,15 +52,22 @@ uv run bandit -r config.py database.py main.py middleware models prompts routers
 uv run pip-audit --strict
 ```
 
-Prompt quality gate:
+Committed-fixture regression check (does not validate candidate output quality):
 
 ```bash
 cd harness
-uv run python -m prompt_eval.run \
-  --version "$(grep -oE 'asdd-v[0-9.]+' ../backend/prompts/base.py)" \
+uv run --project ../backend python -m prompt_eval.run \
+  --version "$(sed -n 's/^ASDD_PROMPT_VERSION = \"\(asdd-v[0-9.]*\)\"/\1/p' ../backend/prompts/base.py)" \
   --baseline asdd-v1.8.0 \
   --report ../prompt_eval_report.md
 ```
+
+Actual prompt quality gate: run the `generated-prompt-gate` workflow job against
+an immutable baseline revision and the candidate, retain its generated evidence,
+and review complete standard and Demo Day packages. Both revisions must use the
+same corpus. Missing provider credentials or missing outputs is an incomplete
+gate, never a pass. The job makes billed provider calls, capped at 100 attempts
+per revision. See [pipeline remediation rollout notes](reviews/PIPELINE_RELIABILITY_REMEDIATION_2026-09-10.md).
 
 Storyboard frontend gate:
 
@@ -89,8 +96,10 @@ Pass criteria:
 - Lemon Squeezy billing (`phase25`) and prompt pipeline harness contracts pass.
 - Storyboard backend/frontend harness contracts and focused Storyboard tests
   pass.
-- Prompt eval report shows no unapproved per-grader regression against the
-  selected baseline.
+- Actual generated candidate packages pass production readiness checks and
+  show no per-grader regression against freshly generated baseline packages.
+  Human review accepts requirement fidelity and cross-stage consistency.
+- Technology policy freshness check passes (`python backend/scripts/check_policy_freshness.py`).
 - Bandit reports no unresolved issues.
 - `pip-audit --strict` reports no known vulnerabilities.
 - Production smoke passes against staging with live LLM smoke enabled.

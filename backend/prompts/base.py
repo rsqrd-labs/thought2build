@@ -109,7 +109,7 @@ logger = structlog.get_logger(__name__)
 # v2.11.1 — re-reviewed the existing technology denylist and refreshed its
 # policy/prompt review dates. Prompt content is unchanged; the prompt-eval gate
 # requires a version bump for every change under backend/prompts/.
-ASDD_PROMPT_VERSION = "asdd-v2.11.1"
+ASDD_PROMPT_VERSION = "asdd-v2.12.0"
 STAGE_PROMPT_VERSIONS: dict[str, str] = {
     # spec-v5: audit M8 — the clarification Q&A block is now fenced with
     # wrap_untrusted_content instead of rendering user-typed answers raw in
@@ -587,31 +587,29 @@ def _enforce_security_rules(name: str, body: str) -> str:
 
 
 async def load_prompt(name: str, fallback: str) -> str:
-    """Fetch a remote prompt override, or use ``fallback`` (cached either way).
+    """Load a content-verified deploy pin; unpinned names are always local.
 
-    The cache key includes a hash of ``fallback``, not just ``name``: most
-    callers pass a constant fallback per name, so this is a no-op for them,
-    but demo_day.py's Fix-1/Fix-2 fallbacks vary by (time_budget_minutes,
-    restricted_environment) for the SAME remote prompt name — keying on
-    ``name`` alone would silently serve one call's cached fallback to a later
-    call with different parameters. Truncated sha256 (not Python's built-in
-    ``hash()``) keeps the key deterministic and matches the ``_fence_nonce``
-    convention already used in this module.
+    A configured pin cannot silently fall back to different prompt bytes. The
+    worker persists the resolved prompt before generating any checkpoints.
     """
-    now = time.time()
-    cache_key = f"{name}:{hashlib.sha256(fallback.encode()).hexdigest()[:16]}"
+    pin = settings.langfuse_prompt_pins.get(name)
+    if pin is None:
+        return fallback
+    version, expected = pin["version"], pin["sha256"]
+    cache_key = f"{name}:{version}:{expected}"
     cached = _PROMPT_CACHE.get(cache_key)
-    if cached and now - cached[0] < settings.langfuse_prompt_cache_ttl:
+    if cached:
         return cached[1]
-    try:
-        remote = await langfuse_service.get_langfuse_client().get_prompt(name)
-    except Exception:
-        remote = None
-    if isinstance(remote, str) and remote:
-        value = _enforce_security_rules(name, remote)
-    else:
-        value = fallback
-    _PROMPT_CACHE[cache_key] = (now, value)
+    remote = await langfuse_service.get_langfuse_client().get_prompt(
+        name, version=version
+    )
+    if (
+        not isinstance(remote, str)
+        or hashlib.sha256(remote.encode()).hexdigest() != expected
+    ):
+        raise ValueError(f"Pinned prompt unavailable or digest mismatch: {name}")
+    value = _enforce_security_rules(name, remote)
+    _PROMPT_CACHE[cache_key] = (time.time(), value)
     return value
 
 

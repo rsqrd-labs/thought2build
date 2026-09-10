@@ -258,7 +258,8 @@ async def test_persist_answers_sanitises_html_in_answers() -> None:
 
     class _CapturingDB:
         async def execute(self, statement):
-            captured["statement"] = statement
+            captured.setdefault("statement", statement)
+            captured.setdefault("statements", []).append(statement)
 
         async def commit(self):
             captured["committed"] = True
@@ -280,6 +281,7 @@ async def test_persist_answers_sanitises_html_in_answers() -> None:
     compiled = captured["statement"].compile()
     params = compiled.params
     assert "clarification_qa" in params
+    assert captured["statements"][1].compile().params["status"] == "stale"
     stored = params["clarification_qa"]
     assert isinstance(stored, list) and len(stored) == 1
     assert "<script>" not in stored[0]["answer"]
@@ -308,7 +310,8 @@ async def test_persist_existing_answers_uses_saved_questions_without_redis(
 
     class _CapturingDB:
         async def execute(self, statement):
-            captured["statement"] = statement
+            captured.setdefault("statement", statement)
+            captured.setdefault("statements", []).append(statement)
 
         async def commit(self):
             captured["committed"] = True
@@ -391,7 +394,8 @@ async def test_persist_existing_answers_sanitises_html_in_answers() -> None:
 
     class _CapturingDB:
         async def execute(self, statement):
-            captured["statement"] = statement
+            captured.setdefault("statement", statement)
+            captured.setdefault("statements", []).append(statement)
 
         async def commit(self):
             captured["committed"] = True

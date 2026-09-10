@@ -470,6 +470,27 @@ async def validate_technology_safety(
         )
 
 
+def analyze_local_technology_safety(
+    stage_type: str,
+    artifact_md: str,
+    deps: dict[str, str] | None = None,
+    *,
+    today: date | None = None,
+) -> list[TechSafetyFinding]:
+    """Deterministic evidence survives independently of external lookup health."""
+    today = today or datetime.now(UTC).date()
+    policy = load_policy()
+    scan_text = _selected_technology_text(stage_type, artifact_md, deps or {})
+    choices = parse_technology_stack(artifact_md) if stage_type == "plan" else []
+    if stage_type in {"harness", "tasks"}:
+        choices.extend(_package_candidates(scan_text, policy))
+    return [
+        *_freshness_findings(policy, today),
+        *_hard_denylist_findings(scan_text, source=stage_type, policy=policy),
+        *_choice_findings(choices, policy=policy, today=today),
+    ]
+
+
 async def analyze_technology_safety(
     stage_type: str,
     artifact_md: str,
