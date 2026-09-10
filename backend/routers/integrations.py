@@ -29,6 +29,7 @@ events are dispatched from T-271's reconcile path via
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 from uuid import UUID
@@ -430,9 +431,23 @@ async def github_webhook(
 
     # Idempotency: record the delivery before dispatch. A unique violation on
     # delivery_id means GitHub re-delivered this event — skip it.
+    #
+    # The payload rides along so a delivery that is recorded but never processed
+    # can be REPLAYED (``reconcile_drift``'s inbox sweep). Because the dedup row
+    # commits on receipt, GitHub's redelivery of such an event is answered
+    # "duplicate" and it would otherwise be lost with no record. Parsing is
+    # best-effort and unconditional — the handler still never branches on event
+    # type — so a body that is not a JSON object simply stores no payload rather
+    # than 500ing a signature-verified webhook.
     try:
         async with db.begin_nested():
-            db.add(GitHubWebhookEvent(delivery_id=delivery_id, event_type=event_type))
+            db.add(
+                GitHubWebhookEvent(
+                    delivery_id=delivery_id,
+                    event_type=event_type,
+                    payload=_decode_payload(raw_body),
+                )
+            )
             await db.flush()
     except IntegrityError:
         GITHUB_WEBHOOK_DEDUPED_TOTAL.labels(event_type=event_type).inc()
@@ -570,6 +585,19 @@ async def _complete_verified_install(
         return _settings_redirect(installed=False)
 
     return _settings_redirect(installed=True)
+
+
+def _decode_payload(raw_body: bytes) -> dict[str, Any] | None:
+    """The delivery body as a JSON object, or ``None`` if it is not one.
+
+    Never raises: the signature already proved this came from GitHub, so a body
+    we cannot store must degrade to "unreplayable", never to a rejected webhook.
+    """
+    try:
+        parsed = json.loads(raw_body)
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _audit_install_rejected(installation_id: int, reason: str) -> None:

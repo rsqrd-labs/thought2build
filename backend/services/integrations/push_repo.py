@@ -30,7 +30,7 @@ from models.integration_push_task import IntegrationPushTask
 from models.stage import Stage
 from models.stage_version import StageVersion
 from models.workspace import Workspace
-from services.integrations.task_parser import compute_task_ref, parse_tasks
+from services.integrations.task_parser import parse_tasks
 
 # The canonical "live push" predicate, mirroring the partial unique index
 # predicate in migration 0016 (``status <> 'failed'``). Kept here, and only here,
@@ -288,9 +288,12 @@ async def resolve_push_task_titles(
     version = await db.get(StageVersion, push.source_stage_version_id)
     if version is None or not version.content:
         return {}
+    # Keyed on the task's own resolved ``task_ref``: a comprehension over
+    # ``compute_task_ref(task.title)`` silently collapses same-titled tasks, and
+    # the disambiguated sibling would then resolve no human ref at all (the UI
+    # would fall back to "Issue #N" for a task that has a perfectly good title).
     return {
-        compute_task_ref(task.title): (task.ref, task.title)
-        for task in parse_tasks(version.content)
+        task.task_ref: (task.ref, task.title) for task in parse_tasks(version.content)
     }
 
 

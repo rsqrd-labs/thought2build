@@ -41,8 +41,8 @@ def test_0031_revises_0030_and_history_is_linear() -> None:
     # eval_results judge-provenance columns). The guard is that there
     # is exactly ONE head — a branched history breaks `alembic upgrade head` on
     # deploy.
-    assert heads == ["0045"], (
-        f"Expected a single migration head (0045), got {heads!r} — a branched "
+    assert heads == ["0048"], (
+        f"Expected a single migration head (0048), got {heads!r} — a branched "
         "history breaks `alembic upgrade head` on deploy."
     )
 

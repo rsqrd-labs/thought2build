@@ -20,7 +20,7 @@ The orchestration (branch/PR plumbing, persistence) lives in
 
 from __future__ import annotations
 
-from services.integrations.task_parser import ParsedTask, compute_task_ref
+from services.integrations.task_parser import ParsedTask
 
 # Stable on-branch location for the generated scaffold so re-export updates the
 # same files in place rather than littering new ones.
@@ -140,7 +140,7 @@ def build_pr_body(
     for task in tasks:
         # ``issue_numbers`` is keyed on the stable compute_task_ref (audit #2);
         # the human ``T-NNN`` stays in the link's display text only.
-        number = issue_numbers.get(compute_task_ref(task.title))
+        number = issue_numbers.get(task.task_ref)
         if number is not None:
             lines.append(f"- Closes #{number} — {task.ref}: {task.title}")
         else:
@@ -168,7 +168,7 @@ def _build_ci_workflow(stacks: list[str]) -> str:
 
 def _task_stub(task: ParsedTask, stack: str) -> tuple[str, str]:
     """A single failing stub test for a task, tagged with its stable task_ref."""
-    task_ref = compute_task_ref(task.title)
+    task_ref = task.task_ref
     slug = task_ref.replace("-", "_")
     title = _escape(task.title)
     if stack == STACK_NODE:
