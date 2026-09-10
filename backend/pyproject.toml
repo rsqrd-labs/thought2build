@@ -36,7 +36,7 @@ dependencies = [
     "httpx==0.28.*",
     "python-multipart==0.0.*",
     "langfuse>=2.60,<3",
-    "weasyprint==69.*",
+    "weasyprint==70.*",
     "jinja2==3.*",
     "pygments==2.*",
     "markdown==3.*",
@@ -79,6 +79,11 @@ select = ["E", "F", "I"]
 # the ASDD_PROMPT_VERSION gate), and a line inside a triple-quoted block cannot
 # carry an inline `# noqa`, so E501 is ignored for the whole prompts package.
 "prompts/*.py" = ["E501"]
+
+# Importing a pytest fixture from another test module is how a fixture is shared
+# without moving it into conftest; the parameter of each test that consumes it
+# then legitimately shadows the imported name, which F811 reads as a redefinition.
+"tests/test_github_sync_recovery.py" = ["F811"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

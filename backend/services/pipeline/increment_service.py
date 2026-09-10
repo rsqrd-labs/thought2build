@@ -233,8 +233,18 @@ class IncrementService:
 
         baseline_tasks_md = stages["tasks"].content or ""
         baseline_parsed = parse_tasks(baseline_tasks_md)
-        pinned_refs = [compute_task_ref(t.title) for t in baseline_parsed]
-        pinned_ref_set = set(pinned_refs)
+        # Two different questions, two different keys:
+        #   pinned_refs      — the baseline's PERSISTED identities, shown to the
+        #                      model so it does not re-emit existing work.
+        #   pinned_ref_set   — "does a task with this TITLE already exist?", the
+        #                      dedup key for _reconcile_delta. It must be the
+        #                      unsalted base ref: the delta is a separate
+        #                      document, so its own occurrence numbering is
+        #                      unrelated to the baseline's and comparing salted
+        #                      refs across the two would let a re-emitted task
+        #                      through as new.
+        pinned_refs = [t.task_ref for t in baseline_parsed]
+        pinned_ref_set = {compute_task_ref(t.title) for t in baseline_parsed}
         baseline_max = _highest_task_number(baseline_tasks_md)
 
         route = self._resolve_route(workspace)
@@ -574,6 +584,11 @@ def _reconcile_delta(
     new_tasks: list[IncrementTask] = []
     next_number = baseline_max
     for task in parsed:
+        # Unsalted base ref on purpose: this is a title-existence test over raw
+        # model output, where a repeated title is a generation artifact to drop —
+        # not two genuinely distinct tasks the way a repeat in the user's own
+        # finalised TASKS.md is. ``task.task_ref`` would salt the second
+        # occurrence and let the duplicate through.
         ref = compute_task_ref(task.title)
         if ref in pinned_ref_set or ref in seen:
             continue
@@ -972,12 +987,15 @@ async def _drive_increment_push(
         issue_numbers = await _sync_increment_issues(
             db, client, push, increment, tasks, milestone
         )
+        # Same source as _sync_increment_issues' loop (each task's own
+        # resolved ``task_ref``): if these two ever disagree, a disambiguated
+        # same-titled task looks obsolete and its issue is closed on every push.
         await retire_obsolete_task_issues(
             db,
             client,
             repo,
             push.id,
-            {compute_task_ref(task.title) for task in tasks},
+            {task.task_ref for task in tasks},
         )
         if push.export_mode == "pr_with_tests":
             await _open_increment_pr(
@@ -1054,7 +1072,7 @@ async def _sync_increment_issues(
         ref: row.external_issue_number for ref, row in existing.items()
     }
     for parsed in tasks:
-        ref = compute_task_ref(parsed.title)
+        ref = parsed.task_ref
         row = existing.get(ref)
         if row is not None:
             # Changed task (same stable task_ref) → update its issue in place.
@@ -1109,7 +1127,7 @@ async def _open_increment_pr(
     # ``_increment_task_refs`` returns stable compute_task_ref keys (audit #2), so
     # match parsed tasks on the same stable key — never the human ``T-NNN``.
     new_refs = await _increment_task_refs(db, push.id, increment.id)
-    new_tasks = [t for t in tasks if compute_task_ref(t.title) in new_refs]
+    new_tasks = [t for t in tasks if t.task_ref in new_refs]
     if not new_tasks:
         return
 

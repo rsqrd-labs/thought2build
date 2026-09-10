@@ -46,7 +46,17 @@ _BOLD_FIELD = re.compile(r"^\*\*(?P<name>[^*]+?):\*\*\s*(?P<rest>.*)$")
 _BACKTICK_REF = re.compile(r"`([^`]+)`")
 
 
-def compute_task_ref(title: str, *, stage: str = "tasks") -> str:
+def normalized_task_title(title: str) -> str:
+    """The case- and whitespace-folded form :func:`compute_task_ref` hashes.
+
+    Exposed so callers that need to detect same-title collisions key on exactly
+    what the ref is derived from, rather than re-deriving a near-miss
+    normalisation of their own.
+    """
+    return _WHITESPACE.sub(" ", title).strip().casefold()
+
+
+def compute_task_ref(title: str, *, stage: str = "tasks", occurrence: int = 0) -> str:
     """Return the stable, content-derived matching key for a task (spec §10,
     Assumption 23).
 
@@ -65,10 +75,27 @@ def compute_task_ref(title: str, *, stage: str = "tasks") -> str:
     Normalization (case- and whitespace-folded) keeps the key stable across
     cosmetic edits; the ``stage`` prefix prevents collisions between same-titled
     tasks that originate in different stages. The 48-bit hex prefix is amply
-    collision-resistant across a single workspace's task set.
+    collision-resistant across *distinct* titles in a single workspace.
+
+    Identical titles are NOT distinct, which is what ``occurrence`` is for. Two
+    tasks titled "Add unit tests" — or "Set Up CI" and "set up ci", which fold
+    together — otherwise derive the same key, and the ``(push_id, task_ref)``
+    unique constraint then rejects the second one mid-export. ``occurrence`` is
+    that task's index among the same-normalised titles in document order, and
+    **occurrence 0 is byte-identical to the unsalted form**, so every ref already
+    persisted in production still matches and renumber-invariance is untouched.
+
+    Callers should not pass ``occurrence`` by hand and should not call this in a
+    loop over a task list at all: :func:`parse_tasks` resolves each task's ref
+    once, in document order, and hands it back on
+    :attr:`ParsedTask.task_ref`. Read that field instead — deriving a ref
+    per-task from the title cannot see the sibling that shares it.
     """
-    normalized = _WHITESPACE.sub(" ", title).strip().casefold()
-    digest = hashlib.sha256(f"{stage}\x1f{normalized}".encode()).hexdigest()
+    normalized = normalized_task_title(title)
+    seed = f"{stage}\x1f{normalized}"
+    if occurrence:
+        seed = f"{seed}\x1f{occurrence}"
+    digest = hashlib.sha256(seed.encode()).hexdigest()
     return f"task-{digest[:12]}"
 
 
@@ -89,6 +116,13 @@ class ParsedTask:
             preserved verbatim. Increment generation (T-279) re-appends this under
             a renumbered heading when it grows TASKS.md, so the appended section
             matches the source document's shape exactly.
+        task_ref: The stable matching identity for this task, resolved ONCE at
+            parse time by :func:`parse_tasks` with its document-order
+            occurrence already applied. Every consumer — export, increment sync,
+            the ``Closes #N`` map, the Projects board, the sync panel — must read
+            this field rather than re-deriving it, because a per-task
+            ``compute_task_ref(title)`` cannot see the sibling that shares the
+            title and would collapse the two onto one key.
     """
 
     ref: str
@@ -97,6 +131,7 @@ class ParsedTask:
     agent_body_md: str = ""
     labels: tuple[str, ...] = field(default_factory=tuple)
     raw_body: str = ""
+    task_ref: str = ""
 
 
 def parse_tasks(content: str) -> list[ParsedTask]:
@@ -119,6 +154,7 @@ def parse_tasks(content: str) -> list[ParsedTask]:
         return []
 
     tasks: list[ParsedTask] = []
+    occurrences: dict[str, int] = {}
     for index, match in enumerate(matches):
         ref = match.group(1)
         title = match.group(2).strip()
@@ -129,8 +165,18 @@ def parse_tasks(content: str) -> list[ParsedTask]:
         )
         raw_body = content[body_start:body_end].strip()
 
+        # Occurrence among same-normalised titles, in document order. Only a
+        # repeat is salted, so a document with unique titles (the overwhelming
+        # majority) produces byte-identical refs and issue bodies to before.
+        normalized = normalized_task_title(title)
+        occurrence = occurrences.get(normalized, 0)
+        occurrences[normalized] = occurrence + 1
+        task_ref = compute_task_ref(title, occurrence=occurrence)
+
         body_md = _format_issue_body(title=title, raw_body=raw_body)
-        agent_body_md = _format_agent_issue_body(title=title, raw_body=raw_body)
+        agent_body_md = _format_agent_issue_body(
+            title=title, raw_body=raw_body, task_ref=task_ref
+        )
         tasks.append(
             ParsedTask(
                 ref=ref,
@@ -139,6 +185,7 @@ def parse_tasks(content: str) -> list[ParsedTask]:
                 agent_body_md=agent_body_md,
                 labels=AGENT_LABELS,
                 raw_body=raw_body,
+                task_ref=task_ref,
             )
         )
 
@@ -180,7 +227,9 @@ _FILES_FIELDS = (
 _TEST_FIELDS = ("harness refs", "test that must pass", "tests", "test")
 
 
-def _format_agent_issue_body(*, title: str, raw_body: str) -> str:
+def _format_agent_issue_body(
+    *, title: str, raw_body: str, task_ref: str | None = None
+) -> str:
     """Render the agent-ready GitHub Issue body (T-277).
 
     A machine-readable YAML header (``task_ref``/``stage``/``spec_anchors``/
@@ -207,7 +256,9 @@ def _format_agent_issue_body(*, title: str, raw_body: str) -> str:
     )
 
     test_refs = _extract_test_refs(fields)
-    task_ref = compute_task_ref(title)
+    # Resolved by the caller (parse_tasks) so a same-titled sibling's salt is
+    # reflected in the YAML header too; falls back for direct callers.
+    task_ref = task_ref or compute_task_ref(title)
     anchors = _spec_anchors(f"{title}\n{raw_body}")
 
     header = _yaml_header(
