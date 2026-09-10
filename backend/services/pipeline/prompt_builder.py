@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -19,6 +18,8 @@ from database import get_shared_redis
 from models import Stage, Workspace
 from services.llm.cost_ledger import LLMCostContext
 from services.observability import PIPELINE_UPSTREAM_SECTION_SKIPPED
+from services.pipeline.context_budget import ContextBudgetError
+from services.pipeline.markdown_structure import headings, matches_heading
 from services.pipeline.problem_compressor import (
     classify_compression_rung,
     get_or_compress,
@@ -127,18 +128,16 @@ def _split_by_h2(content: str) -> list[tuple[str, str]]:
     requirement IDs or API contracts) is summarized rather than silently
     dropped — silent upstream loss is the exact F-7.1 failure mode.
     """
-    segments = re.split(r"(?m)^(## .+)$", content)
+    sections = [
+        (h, start, end) for h, start, end in headings(content) if h.startswith("## ")
+    ]
     parts: list[tuple[str, str]] = []
-    # segments alternates: [preamble, heading1, body1, heading2, body2, ...]
-    preamble = segments[0]
-    if preamble.strip():
-        parts.append(("", preamble))
-    i = 1
-    while i < len(segments):
-        heading = segments[i].strip()
-        body = segments[i + 1] if i + 1 < len(segments) else ""
-        parts.append((heading, body))
-        i += 2
+    first = sections[0][1] if sections else len(content)
+    if content[:first].strip():
+        parts.append(("", content[:first]))
+    for index, (heading, _, end) in enumerate(sections):
+        stop = sections[index + 1][1] if index + 1 < len(sections) else len(content)
+        parts.append((heading, content[end:stop]))
     return parts
 
 
@@ -148,10 +147,9 @@ def _section_aware_injection(
     """Keep critical sections verbatim, summarize narrative sections.
 
     Used only when content exceeds _MAX_UPSTREAM_CHARS even after the 200K
-    bump.  For each section in the mode-appropriate keep-list that is skipped
-    (not preserved verbatim due to remaining budget), the metric
-    `pipeline_upstream_section_skipped_total{stage, section}` is
-    incremented so dashboards can observe the quality regression.
+    bump. A critical section that cannot fit aborts prompt construction and
+    increments pipeline_upstream_section_skipped_total (the legacy metric
+    name). Only narrative may be condensed.
     """
     keep = _keep_sections(stage_type, mode)
     sections = _split_by_h2(content)
@@ -160,20 +158,24 @@ def _section_aware_injection(
     budget_remaining = _MAX_UPSTREAM_CHARS
     for heading, body in sections:
         full = f"{heading}\n{body}"
-        if heading in keep and len(full) <= budget_remaining:
+        critical = any(matches_heading(heading, item) for item in keep)
+        if critical and len(full) <= budget_remaining:
             preserved.append(full)
-            budget_remaining -= len(full)
-        elif heading in keep:
-            # Critical section but no budget — skip and record.  We drop
-            # rather than summarize so the metric fires a fail-loud alert
-            # instead of masking the loss with a lossy RTM summary.
+            budget_remaining -= len(full) + 2
+        elif critical:
+            # Fail before the provider call instead of losing a requirement.
             PIPELINE_UPSTREAM_SECTION_SKIPPED.labels(
                 stage=stage_type, section=heading
             ).inc()
+            raise ContextBudgetError(
+                f"Cannot preserve {stage_type} {heading} within the context budget. "
+                "Split the upstream artifact before continuing."
+            )
         else:
             summarized.append(full)
     summary = summarize_stage_content(stage_type, "\n".join(summarized)).content
-    return "\n".join(preserved + [summary])[:_MAX_UPSTREAM_CHARS]
+    # Only narrative may be condensed. Never slice a preserved contract.
+    return "\n\n".join(preserved + [summary[: max(0, budget_remaining)]])
 
 
 async def build_prompt(
@@ -294,6 +296,23 @@ async def build_prompt(
                 product_surface="problem_compression",
             ),
         )
+        from services.pipeline.problem_compressor import (
+            _is_normative_block,
+            _rung1_cleanup,
+            _split_blocks,
+        )
+
+        cleaned = _rung1_cleanup(workspace.problem_statement)
+        normalized = " ".join(compressed.split())
+        if any(
+            " ".join(block.split()) not in normalized
+            for block in _split_blocks(cleaned)
+            if _is_normative_block(block)
+        ):
+            raise ContextBudgetError(
+                "The problem statement cannot fit without losing requirements. "
+                "Split the scope before continuing."
+            )
         deps["problem_statement"] = compressed
         # Phase D: classify how the statement was condensed so the caller can
         # surface a non-blocking advisory notice for the lossy rungs (2/3). Pure

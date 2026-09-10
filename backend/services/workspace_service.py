@@ -98,13 +98,16 @@ class WorkspaceService:
         return list(result.scalars())
 
     async def get(
-        self, workspace_id: UUID, user_id: UUID, db: AsyncSession
+        self, workspace_id: UUID, user_id: UUID, db: AsyncSession, *, lock: bool = False
     ) -> Workspace:
-        result = await db.execute(
+        stmt = (
             select(Workspace)
             .where(Workspace.id == workspace_id, Workspace.user_id == user_id)
             .options(selectinload(Workspace.stages))
         )
+        if lock:
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        result = await db.execute(stmt)
         workspace = result.scalar_one_or_none()
         if workspace is None:
             raise HTTPException(
@@ -121,7 +124,7 @@ class WorkspaceService:
         problem_statement: str | None = None,
         target_agent: TargetAgent | None = None,
     ) -> Workspace:
-        workspace = await self.get(workspace_id, user_id, db)
+        workspace = await self.get(workspace_id, user_id, db, lock=True)
         if name is not None:
             workspace.name = sanitize_text(name)
         if problem_statement is not None:

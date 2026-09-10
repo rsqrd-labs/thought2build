@@ -135,12 +135,13 @@ from services.pipeline.artifact_validator import (
     reconcile_effort_summary,
     strip_completion_sentinel,
     validate_artifact_completeness_async,
-    validate_sections_async,
+    validate_readiness_async,
 )
 from services.pipeline.background_tasks import (
     BoundedTaskRegistry,
     build_advisory_semaphore,
 )
+from services.pipeline.context_budget import assert_context_fits
 from services.pipeline.critic import CriticFinding, critic_review
 from services.pipeline.diff_engine import (
     apply_diff,
@@ -164,9 +165,16 @@ from services.pipeline.generation_runs import (
     set_run_phase,
     terminalize_interrupted_run,
 )
+from services.pipeline.input_manifest import (
+    cache_identity,
+    restore_workspace,
+    snapshot_workspace,
+    source_identity,
+)
 from services.pipeline.prompt_builder import build_prompt
 from services.pipeline.tech_safety import (
     TECH_SAFETY_GATE_KIND,
+    analyze_local_technology_safety,
     analyze_technology_safety,
     is_blocking_finding,
 )
@@ -178,7 +186,7 @@ from services.queue import (
 )
 from services.research import research_service
 from services.research.research_service import _EMPTY as _EMPTY_RESEARCH
-from services.research.research_service import ResearchContext
+from services.research.research_service import ResearchContext, ResearchSource
 from services.security.output_validator import validate_async
 from services.security.problem_statement_gate import (
     ProblemStatementValidationError,
@@ -3514,6 +3522,9 @@ class StageManager:
             chunk=chunk,
             prior_chunks=prior_chunks,
         )
+        assert_context_fits(
+            route.provider, route.model, system_prompt, chunk_prompt, max_tokens
+        )
         # Live progressive streaming (issue #19 UX): tokens are forwarded to
         # the SSE client as they arrive, batched ~5×/s so the browser is not
         # flooded with per-token events.  The canonical end-of-stream replay
@@ -3728,6 +3739,7 @@ class StageManager:
         # a free full generation.
         resume_seed: dict[str, str] = {}
         resume_source_run_id: UUID | None = None
+        resume_prompt: dict | None = None
         if action == "resume":
             resumed = await load_resume_seed(db, stage=stage)
             if resumed is None:
@@ -3736,6 +3748,21 @@ class StageManager:
                     "There are no saved sections to complete. Regenerate instead.",
                 )
             resume_source_run_id, resume_seed, _planned = resumed
+            source_run = (
+                await db.execute(
+                    select(StageGenerationRun).where(
+                        StageGenerationRun.id == resume_source_run_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if source_run is None or source_run.input_identity != cache_identity(
+                workspace, stage.type
+            ):
+                raise PreflightError(
+                    "resume_inputs_changed",
+                    "Inputs or prompt release changed. Regenerate instead.",
+                )
+            resume_prompt = source_run.prepared_prompt
             free = True
 
         if stage.status not in ("draft", "stale"):
@@ -3833,6 +3860,7 @@ class StageManager:
             problem_statement_hash=_hash_text(workspace.problem_statement),
             upstream_artifact_hashes=_upstream_artifact_hashes(workspace, stage.type),
             user_instruction_hash=_hash_text(""),
+            input_identity=cache_identity(workspace, stage.type),
             output_contract_version=(
                 f"{stage.type}-{TECH_SAFETY_OUTPUT_CONTRACT_VERSION}-"
                 f"{GENERATION_RESEARCH_CACHE_POLICY_VERSION}"
@@ -3851,6 +3879,8 @@ class StageManager:
                     db,
                     stage=stage,
                     user_id=user.id,
+                    input_snapshot=snapshot_workspace(workspace, stage.type),
+                    input_identity=cache_identity(workspace, stage.type),
                     action=action,
                     deduction_ledger_id=None,
                     total_parts=sum(
@@ -3900,7 +3930,7 @@ class StageManager:
                     validation = await validate_async(candidate)
                     if not validation.is_safe:
                         raise SecurityError(validation.reason)
-                    await validate_sections_async(
+                    await validate_readiness_async(
                         stage.type,
                         candidate,
                         _workspace_stage_deps(workspace, stage.type),
@@ -3924,6 +3954,7 @@ class StageManager:
                 run = await lock_running_run(db, generation_run.id)
                 stage = await lock_stage_for_run(db, run)
                 run.completed_parts = run.total_parts
+                stage.source_identity = source_identity(workspace, stage.type)
                 stage.content = candidate
                 stage.current_version += 1
                 stage.status = "draft"
@@ -3941,6 +3972,7 @@ class StageManager:
                     stage_id=stage.id,
                     version=stage.current_version,
                     content=candidate,
+                    source_identity=stage.source_identity,
                     created_by="ai",
                 )
                 db.add(version)
@@ -4123,6 +4155,8 @@ class StageManager:
                     db,
                     stage=stage,
                     user_id=user.id,
+                    input_snapshot=snapshot_workspace(workspace, stage.type),
+                    input_identity=cache_identity(workspace, stage.type),
                     action=action,
                     deduction_ledger_id=(deduction.id if deduction else None),
                     total_parts=sum(
@@ -4145,6 +4179,7 @@ class StageManager:
                     "A generation is already active for this stage.",
                     code="generation_in_progress",
                 ) from exc
+            generation_run.prepared_prompt = resume_prompt
             stage.status = "in_progress"
             stage.deduction_ledger_id = deduction.id if deduction else None
             # Write-once generation start + action: the honest elapsed baseline
@@ -4370,6 +4405,9 @@ class StageManager:
             user_id = run.user_id
             deduction_id = run.deduction_ledger_id
             action = run.action
+            input_snapshot = run.input_snapshot
+            prepared_prompt = run.prepared_prompt
+            original_identity = run.input_identity
             deadline_at = run.deadline_at
             phase = _PhaseTracker()
             phase.bind_run(run)
@@ -4464,7 +4502,11 @@ class StageManager:
         async def _prepare_prompt() -> tuple[ResearchContext, str, str, str, str]:
             async with AsyncSessionLocal() as prep_db:
                 stage = await self._load_stage(stage_id, prep_db)
-                workspace = await self._load_workspace(workspace_id, prep_db)
+                if not input_snapshot:
+                    raise ValueError(
+                        "This legacy run has no frozen inputs; regenerate it."
+                    )
+                workspace = restore_workspace(input_snapshot)
                 # The generation charge already committed before enqueue. Brave's
                 # own billing path performs the authoritative balance check; this
                 # lightweight reference avoids retaining a user ORM object across
@@ -4473,6 +4515,27 @@ class StageManager:
                     id=user_id,
                     credit_balance=None,
                 )
+                if input_snapshot and original_identity != cache_identity(
+                    workspace, stage.type
+                ):
+                    raise ValueError(
+                        "Generation release changed; regenerate "
+                        "with the current release."
+                    )
+                if prepared_prompt:
+                    return (
+                        ResearchContext(
+                            block=prepared_prompt["research"]["block"],
+                            sources=tuple(
+                                ResearchSource(**item)
+                                for item in prepared_prompt["research"]["sources"]
+                            ),
+                        ),
+                        prepared_prompt["system"],
+                        prepared_prompt["user"],
+                        prepared_prompt["compression_rung"],
+                        stage.type,
+                    )
                 research = await self._fetch_research_context(
                     workspace,
                     stage.type,
@@ -4490,6 +4553,15 @@ class StageManager:
                     model=route.model,
                     research_context=research.block,
                 )
+                prompt_run = await lock_running_run(prep_db, run_id)
+                prompt_run.prepared_prompt = {
+                    "system": system_prompt,
+                    "user": user_prompt,
+                    "system_hash": _hash_text(system_prompt),
+                    "user_hash": _hash_text(user_prompt),
+                    "compression_rung": compression_rung,
+                    "research": asdict(research),
+                }
                 await prep_db.commit()
                 return (
                     research,
@@ -4587,6 +4659,7 @@ class StageManager:
             research=research,
             admission=admission,
             resume_content=resume_content,
+            input_snapshot=input_snapshot,
         )
 
     async def _execute_generation_pipeline(
@@ -4611,6 +4684,7 @@ class StageManager:
         research: ResearchContext = _EMPTY_RESEARCH,
         admission: GenerationAdmission | None = None,
         resume_content: dict[str, str] | None = None,
+        input_snapshot: dict | None = None,
     ) -> None:
         """Run a durable worker-owned pipeline on an independent DB session.
 
@@ -4629,7 +4703,11 @@ class StageManager:
         try:
             async with AsyncSessionLocal() as own_db:
                 stage = await self._load_stage(stage_id, own_db)
-                workspace = await self._load_workspace(workspace_id, own_db)
+                workspace = (
+                    restore_workspace(input_snapshot)
+                    if input_snapshot
+                    else await self._load_workspace(workspace_id, own_db)
+                )
                 # End the read transaction immediately so the pooled connection is
                 # released back during the (potentially many-minute) LLM stream
                 # instead of sitting idle-in-transaction the whole time — that
@@ -5020,7 +5098,7 @@ class StageManager:
 
             try:
                 async with asyncio.timeout(max(0.001, control.remaining_seconds)):
-                    await validate_sections_async(
+                    await validate_readiness_async(
                         stage.type, accumulated, dict(deps), mode
                     )
             except MissingSectionError as exc:
@@ -5029,7 +5107,7 @@ class StageManager:
                 record_judge_call_skipped("critic", "deterministic_gate")
                 gate_payload = {
                     "stage": stage.type,
-                    "kind": "missing_sections",
+                    "kind": getattr(exc, "kind", "missing_sections"),
                     "missing": exc.missing,
                     "refunded_prior_attempt": False,
                 }
@@ -5038,7 +5116,7 @@ class StageManager:
                     redis,
                     stage,
                     accumulated,
-                    kind="missing_sections",
+                    kind=getattr(exc, "kind", "missing_sections"),
                     payload=gate_payload,
                     generation_run_id=generation_run_id,
                 )
@@ -5059,6 +5137,7 @@ class StageManager:
             stage = await lock_stage_for_run(db, run)
             if run.completed_parts != run.total_parts:
                 raise RuntimeError("generation_checkpoint_count_mismatch")
+            stage.source_identity = source_identity(workspace, stage.type)
             stage.content = accumulated
             stage.current_version += 1
             stage.status = "draft"
@@ -5086,6 +5165,7 @@ class StageManager:
                 stage_id=stage.id,
                 version=stage.current_version,
                 content=accumulated,
+                source_identity=stage.source_identity,
                 created_by="ai",
                 # Issue #12 (Phase 4): persist the grounding actually injected into
                 # this generation so it is reproducible/diffable and can show its
@@ -5474,7 +5554,12 @@ class StageManager:
                 f"{request.mode}:{request.selection_start}:{request.selection_end}:"
                 f"{request.instruction}"
             ),
-            output_contract_version="refine-v1",
+            input_identity={
+                **cache_identity(workspace, stage.type),
+                "system": _hash_text(system_prompt),
+                "user": _hash_text(user_prompt),
+            },
+            output_contract_version="refine-v2",
         )
         cached_replacement = await get_cached_generation(redis, cache_key)
         if cached_replacement is not None:
@@ -5687,6 +5772,42 @@ class StageManager:
                 )
         return False
 
+    async def _assert_finalisation_readiness(
+        self, stage: Stage, workspace, db: AsyncSession
+    ) -> None:
+        overridden = (
+            stage.quality_gate_status == "overridden"
+            and stage.quality_gate_version == stage.current_version
+        )
+        if not overridden:
+            deps = _workspace_stage_deps(workspace, stage.type)
+            try:
+                await validate_readiness_async(
+                    stage.type, stage.content or "", deps, _workspace_mode(workspace)
+                )
+            except MissingSectionError as exc:
+                stage.quality_gate_status = "blocked"
+                stage.quality_gate_kind = getattr(exc, "kind", "missing_sections")
+                stage.quality_gate_version = stage.current_version
+                stage.quality_gate_payload = {"missing": exc.missing}
+                await db.commit()
+                raise _quality_gate_blocked_error(stage, str(exc)) from exc
+            local = analyze_local_technology_safety(
+                stage.type, stage.content or "", deps
+            )
+            if any(is_blocking_finding(item) for item in local):
+                self._merge_background_quality_findings(
+                    stage,
+                    [item.to_payload() for item in local],
+                    technology_finished=True,
+                    technology_blocked=True,
+                )
+                stage.quality_gate_version = stage.current_version
+                await db.commit()
+                raise _quality_gate_blocked_error(
+                    stage, "Local technology verification failed."
+                )
+
     async def finalise(self, stage_id: UUID, user, db: AsyncSession) -> Stage:
         """Advance a draft stage to finalised status.
 
@@ -5721,6 +5842,20 @@ class StageManager:
             raise ValueError(
                 "Technology verification is still in progress. Try again shortly."
             )
+
+        workspace = await self._load_workspace(stage.workspace_id, db)
+        await self._assert_dependencies_finalised(stage.type, workspace.id, db)
+        if stage.source_identity and stage.source_identity != source_identity(
+            workspace, stage.type
+        ):
+            stage.status = "stale"
+            await db.commit()
+            raise StageDependencyError(
+                "Source inputs changed. Regenerate or explicitly "
+                "acknowledge the stale artifact."
+            )
+
+        await self._assert_finalisation_readiness(stage, workspace, db)
 
         redis = await self._redis_client()
         stage.status = "finalised"
@@ -5769,31 +5904,27 @@ class StageManager:
         return stage
 
     async def acknowledge_stale(self, stage_id: UUID, user, db: AsyncSession) -> Stage:
-        """Accept a stale stage's existing content as-is, restoring it to finalised.
+        """Accept source drift without bypassing current artifact readiness.
 
-        A stage becomes ``stale`` only when it was already ``finalised`` and an
-        upstream source moved (``_mark_downstream_stale``, the regenerate
-        ``was_finalised`` branch, and the workspace problem-statement edit path
-        all gate on ``status == "finalised"``).  Staleness is an *upstream-drift
-        advisory*, not a content-safety signal: this stage's content is
-        unchanged and already passed every gate at its original finalise.  So
-        "Keep" re-affirms that finalised artifact without regenerating (and
-        without spending a credit) — the gap the prior cosmetic-only Keep left
-        open, which forced users to regenerate to escape ``stale``.
-
-        This is deliberately NOT a thin wrapper over ``finalise()``.  That path's
-        side effects (downstream-stale propagation, storyboard/GitHub-push
-        invalidation, the finalise-time tech-safety re-check) all assume the
-        content *changed*.  Here it has not, so re-running them would be wrong:
-        acknowledging a stale *middle* stage would incorrectly re-stale a
-        finalised downstream that is still consistent with this stage's
-        unchanged content.  Restoring the prior finalised status is the whole
-        operation.
+        Content stays unchanged, so existing downstream artifacts are not
+        invalidated again. Drafts can also become stale; accepting their source
+        lineage must still enforce the same gates as normal finalisation.
         """
         stage = await self._load_stage(stage_id, db, lock=True)
         if stage.status != "stale":
             raise ValueError(f"Stage status {stage.status!r} cannot be acknowledged")
 
+        workspace = await self._load_workspace(stage.workspace_id, db)
+        await self._assert_dependencies_finalised(stage.type, workspace.id, db)
+        if stage.quality_gate_version == stage.current_version:
+            if stage.quality_gate_status == "blocked":
+                raise _quality_gate_blocked_error(
+                    stage, "Regenerate or override before accepting this artifact."
+                )
+            if stage.quality_gate_status == "checking":
+                raise ValueError("Technology verification is still in progress.")
+        await self._assert_finalisation_readiness(stage, workspace, db)
+        stage.source_identity = source_identity(workspace, stage.type)
         stage.status = "finalised"
         stage.finalised_at = datetime.now(UTC)
         stage.updated_at = datetime.now(UTC)
@@ -5867,6 +5998,7 @@ class StageManager:
         # identical bytes for a given version — sanitization happens at
         # consumption boundaries only — so restoring a version is a plain byte
         # copy with no re-sanitize.
+        stage.source_identity = version.source_identity
         stage.content = version.content
         restored_version_id: UUID | None = None
         eval_context = ""
@@ -5877,6 +6009,7 @@ class StageManager:
                 stage_id=stage.id,
                 version=stage.current_version,
                 content=version.content,
+                source_identity=version.source_identity,
                 created_by="user",
                 research_context=version.research_context,
                 research_sources=version.research_sources,
@@ -5990,6 +6123,7 @@ class StageManager:
             stage_id=stage.id,
             version=stage.current_version,
             content=new_content,
+            source_identity=stage.source_identity,
             created_by="user",
         )
         db.add(version)
@@ -6064,7 +6198,8 @@ class StageManager:
             select(Stage).where(
                 Stage.workspace_id == stage.workspace_id,
                 Stage.type.in_(downstream_types),
-                Stage.status == "finalised",
+                Stage.status.in_(("finalised", "draft")),
+                Stage.content.is_not(None),
             )
         )
         for downstream in result.scalars():
@@ -6118,7 +6253,13 @@ class StageManager:
             # past the guard: a second charge + a second pipeline (the exact
             # "duplicate LLM call" hazard the lock exists to prevent). Forcing a
             # refresh makes the locked read reflect the just-committed row.
-            stmt = stmt.with_for_update().execution_options(populate_existing=True)
+            # Source edits and finalization serialize on their shared workspace.
+            # Lock both rows in one query; no lock spans provider I/O.
+            stmt = (
+                stmt.join(Workspace, Workspace.id == Stage.workspace_id)
+                .with_for_update(of=(Workspace, Stage))
+                .execution_options(populate_existing=True)
+            )
         result = await db.execute(stmt)
         stage = result.scalar_one_or_none()
         if stage is None:
@@ -6186,6 +6327,7 @@ class StageManager:
             select(Workspace)
             .where(Workspace.id == workspace_id)
             .options(selectinload(Workspace.stages))
+            .execution_options(populate_existing=True)
         )
         workspace = result.scalar_one_or_none()
         if workspace is None:
@@ -6303,6 +6445,14 @@ class StageManager:
         }
         stage.quality_gate_version = stage.current_version
         stage.quality_gate_failed_at = None
+        local = analyze_local_technology_safety(stage.type, stage.content or "", {})
+        if any(is_blocking_finding(finding) for finding in local):
+            self._merge_background_quality_findings(
+                stage,
+                [finding.to_payload() for finding in local],
+                technology_finished=True,
+                technology_blocked=True,
+            )
 
     def _merge_background_quality_findings(
         self,
@@ -6400,6 +6550,7 @@ class StageManager:
             "detail": "The bounded external technology check did not complete.",
             "remediation": "Review the selected versions before deployment.",
         }
+        local = analyze_local_technology_safety(stage_type, content, deps)
         try:
             async with asyncio.timeout(
                 float(settings.stage_technology_check_timeout_seconds)
@@ -6410,6 +6561,7 @@ class StageManager:
                     deps,
                     redis=await self._redis_client(),
                 )
+            findings = local + findings
             finding_payloads = [finding.to_payload() for finding in findings]
             blocked = any(is_blocking_finding(finding) for finding in findings)
         except Exception:
@@ -6418,8 +6570,10 @@ class StageManager:
                 extra={"stage": stage_type, "stage_id": str(stage_id)},
                 exc_info=True,
             )
-            finding_payloads = [unverified]
-            blocked = False
+            finding_payloads = [finding.to_payload() for finding in local] + [
+                unverified
+            ]
+            blocked = any(is_blocking_finding(finding) for finding in local)
 
         from database import AsyncSessionLocal  # noqa: PLC0415
 
@@ -6677,6 +6831,10 @@ class StageManager:
         if generation_run_id is not None:
             run = await lock_running_run(db, generation_run_id)
             stage = await lock_stage_for_run(db, run)
+            if run.input_snapshot:
+                stage.source_identity = source_identity(
+                    restore_workspace(run.input_snapshot), stage.type
+                )
 
         blocked_content = _strip_code_fence(content).strip()
         now = datetime.now(UTC)
@@ -6696,6 +6854,7 @@ class StageManager:
                 stage_id=stage.id,
                 version=stage.current_version,
                 content=blocked_content,
+                source_identity=stage.source_identity,
                 created_by="ai",
             )
         )
@@ -6961,6 +7120,7 @@ class StageManager:
                 stage_id=stage.id,
                 version=stage.current_version,
                 content=merged,
+                source_identity=stage.source_identity,
                 created_by="ai",
             )
             db.add(version)

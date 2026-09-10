@@ -1,24 +1,19 @@
 name: prompt-eval
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - "backend/prompts/**"
-      - "backend/services/pipeline/prompt_builder.py"
-      - "backend/services/pipeline/problem_compressor.py"
-      - "backend/services/llm/model_catalog.py"
-      - "backend/services/llm/tier_policy.py"
-      - "backend/services/llm/output_budget.py"
+      - "backend/services/pipeline/**"
+      - "backend/services/llm/**"
+      - "backend/config.py"
+      - "backend/worker.py"
       - "harness/prompt_eval/**"
       - "docs/evals/golden_prompts/**"
       - ".github/workflows/prompt-eval.yml"
 
-# This workflow makes LIVE, billed provider calls (the eval run below uses the
-# real ANTHROPIC/OPENAI/GOOGLE keys), so a superseded run costs money and not
-# just Actions minutes. Push three times to a prompt PR and the old two runs
-# would otherwise keep buying tokens for a report nobody will read. Cancel them.
-# Safe to cancel unconditionally: this is a PR-only advisory report — it ships
-# nothing and holds no lock.
+# Cancel superseded fixture and live candidate evaluations.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -66,19 +61,79 @@ jobs:
       - name: Install backend dependencies
         run: uv sync --project backend
 
-      - name: Run prompt eval
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      - name: Grade committed fixtures (offline; not candidate quality)
         run: |
           cd harness
-          uv run python -m prompt_eval.run \
-            --version "$(grep -oE 'asdd-v[0-9.]+' ../backend/prompts/base.py)" \
+          uv run --project ../backend python -m prompt_eval.run \
+            --version "$(sed -n 's/^ASDD_PROMPT_VERSION = \"\(asdd-v[0-9.]*\)\"/\1/p' ../backend/prompts/base.py)" \
             --baseline asdd-v1.8.0 \
             --report ../prompt_eval_report.md
 
       - name: Comment report on PR
+        if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v2
         with:
           path: prompt_eval_report.md
+
+  generated-prompt-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      DATABASE_URL: postgresql+asyncpg://unused:unused@127.0.0.1:1/unused
+      REDIS_URL: redis://127.0.0.1:1/0
+      JWT_PRIVATE_KEY: eval-unused
+      JWT_PUBLIC_KEY: eval-unused
+      GOOGLE_CLIENT_ID: eval-unused
+      GOOGLE_CLIENT_SECRET: eval-unused
+      FRONTEND_URL: http://localhost:5173
+      ENCRYPTION_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      CSRF_SECRET: eval-only-secret-not-used-for-authentication
+      ENVIRONMENT: test
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || 'main' }}
+          path: baseline
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.8"
+          enable-cache: true
+      - run: uv sync --project backend
+      - name: Generate both revisions with a bounded call count
+        # Missing keys fail this gate, including fork PRs. They require a trusted
+        # evaluation run; absence of candidate evidence is never a quality pass.
+        run: |
+          uv run --project backend python - <<'PY'
+          import os, subprocess, sys
+          if not any(os.environ.get(k) for k in ('ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GOOGLE_API_KEY')):
+              raise SystemExit('Live candidate evidence required: configure evaluation provider secrets on a trusted run.')
+          failures = []
+          for label, root in [('baseline', 'baseline/backend'), ('candidate', 'backend')]:
+              proc = subprocess.run([sys.executable, 'harness/prompt_eval/live.py',
+                  '--allow-live', '--code-root', root, '--output', f'eval-results/{label}.json',
+                  '--max-provider-calls', '100'])
+              if proc.returncode:
+                  failures.append(label)
+          if failures:
+              raise SystemExit(f'Generation failed: {failures}; inspect eval-results.')
+          PY
+      - name: Compare actual generated packages
+        run: >-
+          uv run --project backend python harness/prompt_eval/compare_live.py
+          --candidate eval-results/candidate.json --baseline eval-results/baseline.json
+      - name: Preserve reviewable prompts, outputs, and provider attempts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: generated-prompt-evidence
+          path: eval-results/
+          retention-days: 14

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -9,8 +10,9 @@ import prompts.spec as spec_prompts
 
 
 @pytest.fixture(autouse=True)
-def clear_prompt_cache() -> None:
+def clear_prompt_cache(monkeypatch) -> None:
     prompt_base._PROMPT_CACHE.clear()
+    monkeypatch.setattr(prompt_base.settings, "langfuse_prompt_pins", {})
 
 
 @pytest.mark.asyncio
@@ -35,6 +37,10 @@ async def test_load_prompt_uses_remote_prompt_when_available() -> None:
     )
     client = MagicMock()
     client.get_prompt = AsyncMock(return_value=remote_body)
+    prompt_base.settings.langfuse_prompt_pins["thought2build.spec.system"] = {
+        "version": 3,
+        "sha256": hashlib.sha256(remote_body.encode()).hexdigest(),
+    }
 
     with patch.object(
         prompt_base.langfuse_service, "get_langfuse_client", return_value=client
@@ -58,6 +64,10 @@ async def test_load_prompt_appends_security_rules_to_remote_without_them() -> No
 
     client = MagicMock()
     client.get_prompt = AsyncMock(return_value=remote_body)
+    prompt_base.settings.langfuse_prompt_pins["thought2build.spec.system"] = {
+        "version": 3,
+        "sha256": hashlib.sha256(remote_body.encode()).hexdigest(),
+    }
 
     with patch.object(
         prompt_base.langfuse_service, "get_langfuse_client", return_value=client
@@ -81,6 +91,10 @@ async def test_load_prompt_does_not_double_append_security_rules() -> None:
     remote_body = "Plain remote body."
     client = MagicMock()
     client.get_prompt = AsyncMock(return_value=remote_body)
+    prompt_base.settings.langfuse_prompt_pins["thought2build.spec.system"] = {
+        "version": 3,
+        "sha256": hashlib.sha256(remote_body.encode()).hexdigest(),
+    }
 
     with patch.object(
         prompt_base.langfuse_service, "get_langfuse_client", return_value=client
@@ -115,6 +129,10 @@ async def test_load_prompt_uses_ttl_cache(monkeypatch: pytest.MonkeyPatch) -> No
     remote = "REMOTE BODY\n\n" f"{prompt_base.SECURITY_AND_PRIVACY_RULES}"
     client = MagicMock()
     client.get_prompt = AsyncMock(return_value=remote)
+    prompt_base.settings.langfuse_prompt_pins["thought2build.spec.system"] = {
+        "version": 3,
+        "sha256": hashlib.sha256(remote.encode()).hexdigest(),
+    }
 
     with patch.object(
         prompt_base.langfuse_service, "get_langfuse_client", return_value=client
@@ -124,4 +142,4 @@ async def test_load_prompt_uses_ttl_cache(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert first == remote
     assert second == remote
-    client.get_prompt.assert_awaited_once_with("thought2build.spec.system")
+    client.get_prompt.assert_awaited_once_with("thought2build.spec.system", version=3)

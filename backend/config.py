@@ -77,12 +77,32 @@ class Settings(BaseSettings):
     langfuse_public_key: str = ""
     langfuse_host: str = "https://cloud.langfuse.com"
     langfuse_prompt_cache_ttl: int = 300
+    # Remote prompt bodies are deploy-pinned by name to {version, sha256}.
+    # Unlisted names use the reviewed local prompt. Never resolve "latest".
+    langfuse_prompt_pins: dict[str, dict] = {}
+
+    @field_validator("langfuse_prompt_pins")
+    @classmethod
+    def validate_prompt_pins(cls, pins: dict[str, dict]) -> dict[str, dict]:
+        import re
+
+        for name, pin in pins.items():
+            if (
+                not isinstance(pin.get("version"), int)
+                or isinstance(pin.get("version"), bool)
+                or pin["version"] < 1
+                or not re.fullmatch(r"[0-9a-f]{64}", str(pin.get("sha256", "")))
+            ):
+                raise ValueError(f"Invalid immutable prompt pin for {name}")
+        return pins
+
     # Hard upper bound on how long a single Langfuse prompt fetch may take.
     # The SDK's get_prompt is synchronous and on a cache miss issues a
     # blocking HTTP call (default ~10s × 3 retries). We dispatch it to a
     # worker thread and bound the await with this timeout so a slow or
     # unreachable Langfuse host cannot stall the event loop or stage
-    # generation. On timeout the local fallback prompt is used.
+    # generation. A configured immutable pin fails on timeout; unpinned
+    # prompt names use local bodies without a fetch.
     langfuse_prompt_fetch_timeout_seconds: float = 5.0
     langfuse_content_capture_ack: bool = False
 

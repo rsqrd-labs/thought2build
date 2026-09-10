@@ -585,7 +585,9 @@ async def get_system_prompt(
     fallback = _demo_day_system_prompt(
         role, time_budget_minutes, restricted_environment
     )
-    return await load_prompt(_REMOTE_PROMPT_NAMES[stage_type], fallback)
+    body = await load_prompt(_REMOTE_PROMPT_NAMES[stage_type], fallback)
+    directive = _demo_day_directive(time_budget_minutes, restricted_environment)
+    return body if directive in body else f"{body}\n\n{directive}"
 
 
 # Each Demo Day user-prompt builder below carries its own historical phrasing

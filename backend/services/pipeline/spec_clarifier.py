@@ -52,6 +52,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import prompts.spec_clarification as clarification_prompt
 from config import settings
+from models.stage import Stage
 from models.workspace import Workspace
 from services.llm.cost_ledger import LLMCostContext
 from services.llm.gateway import get_llm
@@ -355,6 +356,18 @@ async def persist_answers(
         update(Workspace)
         .where(Workspace.id == workspace_id)
         .values(clarification_qa=cleaned)
+    )
+    # The workspace UPDATE holds the same row lock as finalisation. Invalidate
+    # existing artifacts in that transaction so a concurrent finalise cannot
+    # leave an artifact marked current after its answers changed.
+    await db.execute(
+        update(Stage)
+        .where(
+            Stage.workspace_id == workspace_id,
+            Stage.status.in_(["draft", "finalised"]),
+            Stage.content.is_not(None),
+        )
+        .values(status="stale")
     )
     await db.commit()
     # The round key has done its job, and existing-mode saves should also clear

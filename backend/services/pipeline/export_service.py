@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import re
 import zipfile
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Stage, Workspace
 from services.pipeline import agent_manual_service, construction_verdict_service
+from services.pipeline.export_verification import verification_manifest
 from services.security.downstream_command_guard import redact_unsafe_lines
 
 logger = logging.getLogger(__name__)
@@ -221,6 +223,11 @@ async def build_export(workspace_id: UUID, user_id: UUID, db: AsyncSession) -> b
 
         for path, content in harness_files.items():
             zf.writestr(path, content)
+
+        zf.writestr(
+            "VERIFICATION.json",
+            json.dumps(verification_manifest(workspace, stages), indent=2),
+        )
 
         stage_md = {kind: (stage.content or "") for kind, stage in stages.items()}
         for (
