@@ -37,14 +37,21 @@ def test_0031_revises_0030_and_history_is_linear() -> None:
 
     revised = {m.down_revision for m in modules if m.down_revision}
     heads = [m.revision for m in modules if m.revision not in revised]
-    # The single head advances as migrations are added (0045 adds the
-    # eval_results judge-provenance columns). The guard is that there
-    # is exactly ONE head — a branched history breaks `alembic upgrade head` on
-    # deploy.
-    assert heads == ["0045"], (
-        f"Expected a single migration head (0045), got {heads!r} — a branched "
+    # New additive migrations advance the head without breaking the invariant.
+    assert len(heads) == 1, (
+        f"Expected a single migration head, got {heads!r} — a branched "
         "history breaks `alembic upgrade head` on deploy."
     )
+    assert len(by_revision) == len(modules), "Duplicate migration revision IDs"
+    visited = set()
+    revision = heads[0]
+    while revision is not None:
+        assert revision in by_revision, f"Missing parent revision {revision!r}"
+        assert revision not in visited, f"Cycle at migration {revision!r}"
+        visited.add(revision)
+        revision = by_revision[revision].down_revision
+        assert revision is None or isinstance(revision, str), "History must be linear"
+    assert visited == set(by_revision), "Disconnected migration history"
 
 
 def test_0031_builds_a_postgres_only_partial_index_on_the_sweep_predicate() -> None:
