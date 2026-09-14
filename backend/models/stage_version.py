@@ -48,6 +48,7 @@ class StageVersion(Base):
         nullable=False,
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_identity: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_by: Mapped[str] = mapped_column(Text, nullable=False)
     # Brave web-research provenance (issue #12, Phase 4). Both NULL unless this

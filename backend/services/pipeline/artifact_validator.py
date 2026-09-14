@@ -14,6 +14,8 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from services.pipeline.markdown_structure import headings, matches_heading
+
 # Required section headings per stage.  Order is the order they appear in the
 # system prompt for each stage; the validator does NOT enforce order (just
 # presence), but keeping the list in canonical order makes it easier to audit
@@ -336,9 +338,74 @@ def validate_sections(
             if sentinel.search(upstream):
                 required.append(heading)
 
-    missing = [heading for heading in required if heading not in artifact_md]
+    actual = {heading for heading, _, _ in headings(artifact_md)}
+    missing = [
+        heading
+        for heading in required
+        if not any(matches_heading(item, heading) for item in actual)
+    ]
     if missing:
         raise MissingSectionError(stage_type, missing)
+
+
+# Readiness and billing are independent. These failures block ordinary use but
+# do not trigger refunds or automatic full regeneration.
+STRUCTURAL_BLOCK_CODES = frozenset(
+    {
+        "unbalanced_code_fence",
+        "harness_file_tree_missing_block",
+        "harness_matrix_missing_file",
+        "harness_matrix_missing_test",
+        "missing_harness_file_blocks",
+        "incomplete_harness_file_block",
+        "missing_task_blocks",
+        "incomplete_task_block",
+        "incomplete_task_fields",
+        "invalid_task_dependency_order",
+        "task_harness_ref_not_found",
+        "rtm_missing_upstream_id",
+        "insufficient_upstream_traceability",
+        "harness_requirement_not_test_mapped",
+    }
+)
+
+
+class StructuralReadinessError(MissingSectionError):
+    kind = "structural_validity"
+
+
+def validate_readiness(
+    stage_type: str,
+    artifact_md: str,
+    deps: dict[str, str] | None = None,
+    mode: str = "standard",
+) -> None:
+    validate_sections(stage_type, artifact_md, deps, mode)
+    try:
+        validate_artifact_completeness(stage_type, artifact_md, deps, mode)
+    except IncompleteArtifactError as exc:
+        blockers = [
+            issue
+            for issue in exc.issues
+            if issue.code in STRUCTURAL_BLOCK_CODES or issue.is_refundable
+        ]
+        if blockers:
+            raise StructuralReadinessError(
+                stage_type, [f"{issue.code}: {issue.detail}" for issue in blockers]
+            ) from exc
+
+
+async def validate_readiness_async(
+    stage_type: str,
+    artifact_md: str,
+    deps: dict[str, str] | None = None,
+    mode: str = "standard",
+) -> None:
+    from services.cpu_offload import run_cpu_bound
+
+    await run_cpu_bound(
+        artifact_md, validate_readiness, stage_type, artifact_md, deps, mode
+    )
 
 
 async def validate_sections_async(

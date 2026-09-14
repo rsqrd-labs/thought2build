@@ -807,7 +807,7 @@ async def test_missing_section_gate_persists_blocked_draft() -> None:
         set_cache as mc,
         get_llm,
         patch(
-            "services.pipeline.stage_manager.validate_sections_async",
+            "services.pipeline.stage_manager.validate_readiness_async",
             new_callable=AsyncMock,
             side_effect=MissingSectionError("spec", missing),
         ),
@@ -1082,7 +1082,7 @@ async def test_async_advisory_section_gate_still_blocks_inline() -> None:
         set_cache,
         get_llm,
         patch(
-            "services.pipeline.stage_manager.validate_sections_async",
+            "services.pipeline.stage_manager.validate_readiness_async",
             new_callable=AsyncMock,
             side_effect=MissingSectionError("spec", missing),
         ),

@@ -170,6 +170,7 @@ class Stage(Base):
         nullable=False,
     )
     type: Mapped[str] = mapped_column(String, nullable=False)
+    source_identity: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     content: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String, nullable=False)
     current_version: Mapped[int] = mapped_column(

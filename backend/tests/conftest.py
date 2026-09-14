@@ -110,3 +110,19 @@ def _reset_shared_redis():
     yield
     database._shared_redis = None
     credit_service._redis = None
+
+
+@pytest.fixture(autouse=True)
+def _pin_technology_policy_clock(monkeypatch):
+    """Behavior tests use a fixed clock; scheduled freshness checks use real time."""
+    from datetime import UTC, datetime
+
+    from services.pipeline import tech_safety
+
+    class ReviewDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 9, 6, tzinfo=UTC)
+            return value.astimezone(tz) if tz else value.replace(tzinfo=None)
+
+    monkeypatch.setattr(tech_safety, "datetime", ReviewDateTime)

@@ -551,10 +551,9 @@ def test_section_aware_injection_increments_metric_when_keep_section_skipped(
     labels = {"stage": "plan", "section": "## API Design"}
     before = REGISTRY.get_sample_value(_SKIPPED_METRIC, labels) or 0.0
 
-    result = _section_aware_injection("plan", content)
+    with pytest.raises(prompt_builder.ContextBudgetError, match="API Design"):
+        _section_aware_injection("plan", content)
 
     after = REGISTRY.get_sample_value(_SKIPPED_METRIC, labels) or 0.0
     assert after - before == 1.0
-    # The kept RTM still survives; the dropped section is absent verbatim.
-    assert "## Requirement Traceability Matrix" in result
-    assert "POST /things" not in result
+    # Generation fails before returning a prompt with a lost API contract.

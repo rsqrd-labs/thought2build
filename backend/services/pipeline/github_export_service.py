@@ -48,6 +48,7 @@ Idempotent re-export:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from contextlib import nullcontext
@@ -1404,4 +1405,10 @@ def _build_file_map(
         workspace_id=workspace.id if workspace is not None else None,
     )
     files.update(harness_files)
+    if workspace is not None:
+        from services.pipeline.export_verification import verification_manifest
+
+        files["VERIFICATION.json"] = json.dumps(
+            verification_manifest(workspace, stages), indent=2
+        )
     return files

@@ -85,6 +85,16 @@ def _assert_disposable_database(url: str) -> None:
         )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_document_quality(monkeypatch):
+    # These tests exercise real database concurrency with deliberately minimal
+    # document fixtures. Structural behavior is tested against real artifacts
+    # in test_pipeline_reliability and test_stage_manager.
+    monkeypatch.setattr(
+        "services.pipeline.stage_manager.validate_readiness_async", AsyncMock()
+    )
+
+
 @pytest_asyncio.fixture
 async def db_engine():
     """Per-test engine on the test's own event loop; resets the schema first.
@@ -404,7 +414,7 @@ async def test_finalise_retry_after_deadlock(db_engine, seed_data):
                 workspace_id=workspace_id,
                 type="harness",
                 content="# Harness content",
-                status="draft",
+                status="finalised",
                 current_version=1,
             )
         )
@@ -488,3 +498,120 @@ async def test_finalise_retry_after_serialization_failure(db_engine, seed_data):
     async with factory() as session:
         stage = await manager.finalise(stage_id, user, session)
         assert stage.status == "finalised"
+
+
+async def test_source_edit_waits_for_finalise_then_marks_result_stale(
+    db_engine, seed_data
+):
+    """Different stage/source writes serialize through the workspace row."""
+    from services.workspace_service import WorkspaceService
+
+    user_id, workspace_id, stage_id = seed_data
+    factory = async_sessionmaker(db_engine, expire_on_commit=False)
+    manager = _manager()
+    locked, release = asyncio.Event(), asyncio.Event()
+    original = manager._load_workspace
+
+    async def pause_after_lock(workspace_id, session):
+        workspace = await original(workspace_id, session)
+        locked.set()
+        await release.wait()
+        return workspace
+
+    manager._load_workspace = pause_after_lock
+
+    async def finalise():
+        async with factory() as session:
+            await manager.finalise(stage_id, _FakeUser(user_id), session)
+
+    async def edit():
+        async with factory() as session:
+            await WorkspaceService().update(
+                workspace_id,
+                user_id,
+                None,
+                session,
+                problem_statement=(
+                    "I want to build a web app for teams to track inventory "
+                    "and approve purchases."
+                ),
+            )
+
+    finish = asyncio.create_task(finalise())
+    await asyncio.wait_for(locked.wait(), timeout=5)
+    change = asyncio.create_task(edit())
+    try:
+        await asyncio.sleep(0.05)
+        assert not change.done(), "source edit escaped the workspace lock"
+    finally:
+        release.set()
+    await asyncio.wait_for(asyncio.gather(finish, change), timeout=10)
+    async with factory() as session:
+        stage = await session.get(Stage, stage_id)
+        assert stage.status == "stale"
+
+
+async def test_source_manifest_rejects_edit_committed_before_finalise(
+    db_engine, seed_data
+):
+    from services.pipeline.input_manifest import source_identity
+    from services.pipeline.stage_manager import StageDependencyError
+    from services.workspace_service import WorkspaceService
+
+    user_id, workspace_id, stage_id = seed_data
+    factory = async_sessionmaker(db_engine, expire_on_commit=False)
+    manager = _manager()
+    async with factory() as session:
+        workspace = await manager._load_workspace(workspace_id, session)
+        stage = await session.get(Stage, stage_id)
+        stage.source_identity = source_identity(workspace, "tasks")
+        await session.commit()
+    async with factory() as session:
+        await WorkspaceService().update(
+            workspace_id,
+            user_id,
+            None,
+            session,
+            problem_statement=(
+                "I want to build a web app for doctors to schedule "
+                "appointments and notify patients."
+            ),
+        )
+    async with factory() as session:
+        with pytest.raises(StageDependencyError, match="Source inputs changed"):
+            await manager.finalise(stage_id, _FakeUser(user_id), session)
+    async with factory() as session:
+        assert (await session.get(Stage, stage_id)).status == "stale"
+
+
+async def test_generation_snapshot_roundtrips_in_postgres(db_engine, seed_data):
+    from models import StageGenerationRun
+    from services.pipeline.generation_runs import create_generation_run
+    from services.pipeline.input_manifest import cache_identity, snapshot_workspace
+
+    user_id, workspace_id, stage_id = seed_data
+    factory = async_sessionmaker(db_engine, expire_on_commit=False)
+    manager = _manager()
+    async with factory() as session:
+        workspace = await manager._load_workspace(workspace_id, session)
+        stage = await session.get(Stage, stage_id)
+        frozen = snapshot_workspace(workspace, "tasks")
+        identity = cache_identity(workspace, "tasks")
+        run = await create_generation_run(
+            session,
+            stage=stage,
+            user_id=user_id,
+            action="generate",
+            deduction_ledger_id=None,
+            total_parts=1,
+            input_snapshot=frozen,
+            input_identity=identity,
+        )
+        run.prepared_prompt = {"system": "frozen system", "user": "frozen user"}
+        run_id = run.id
+        await session.commit()
+    async with factory() as session:
+        run = await session.get(StageGenerationRun, run_id)
+        assert run.input_snapshot == frozen
+        assert run.input_identity == identity
+        assert run.prepared_prompt["system"] == "frozen system"

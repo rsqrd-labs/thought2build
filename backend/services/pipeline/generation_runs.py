@@ -18,6 +18,7 @@ from models import Stage, StageGenerationChunk, StageGenerationRun, StageVersion
 from models.stage_generation import TERMINAL_GENERATION_STATUSES
 from services.credit_service import credit_service
 from services.pipeline.chunk_labels import chunk_labels
+from services.pipeline.input_manifest import restore_workspace, source_identity
 from services.security.output_validator import validate_async
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,8 @@ async def create_generation_run(
     now: datetime | None = None,
     chunk_plan: list[str] | None = None,
     resume_source_run_id: UUID | None = None,
+    input_snapshot: dict | None = None,
+    input_identity: dict | None = None,
 ) -> StageGenerationRun:
     now = now or datetime.now(UTC)
     run = StageGenerationRun(
@@ -202,6 +205,8 @@ async def create_generation_run(
         user_id=user_id,
         deduction_ledger_id=deduction_ledger_id,
         action=action,
+        input_snapshot=input_snapshot,
+        input_identity=input_identity,
         chunk_plan=list(chunk_plan) if chunk_plan else None,
         resume_source_run_id=resume_source_run_id,
         status="running",
@@ -549,7 +554,14 @@ async def terminalize_interrupted_run(
     # ``combined`` is the gate on suppressing the refund: it is the content that
     # actually reaches the user's draft. Without it there is nothing to resume
     # onto, and withholding the credit would charge for nothing.
-    resumable = bool(completed_keys) and bool(missing_keys) and bool(combined)
+    resumable = (
+        bool(completed_keys)
+        and bool(missing_keys)
+        and bool(combined)
+        and bool(run.input_snapshot)
+        and bool(run.input_identity)
+        and bool(run.prepared_prompt)
+    )
 
     refunded = 0
     if run.deduction_ledger_id is not None and not resumable:
@@ -561,6 +573,11 @@ async def terminalize_interrupted_run(
     if combined:
         result_version = stage.current_version + 1
         now = datetime.now(UTC)
+        stage.source_identity = (
+            source_identity(restore_workspace(run.input_snapshot), stage.type)
+            if run.input_snapshot
+            else None
+        )
         stage.content = combined
         stage.current_version = result_version
         stage.status = "draft"
@@ -610,6 +627,7 @@ async def terminalize_interrupted_run(
                 stage_id=stage.id,
                 version=result_version,
                 content=combined,
+                source_identity=stage.source_identity,
                 created_by="ai",
             )
         )

@@ -463,7 +463,10 @@ describe("ExportGitHubModal", () => {
 
     renderModal()
 
-    await screen.findByRole("listbox", { name: /repositories/i })
+    // The initial picker renders before the repository request settles. Its
+    // response chooses the default mode, so clicking the transient toggle can
+    // be overwritten. Wait for fetched data before exercising manual mode.
+    await screen.findByRole("button", { name: /api-server/i })
     expect(
       screen.queryByRole("button", { name: /create a new repository/i }),
     ).not.toBeInTheDocument()

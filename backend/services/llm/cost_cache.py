@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from redis.exceptions import RedisError
 
 DEFAULT_GENERATION_CACHE_TTL_SECONDS = 60 * 60 * 24
-GENERATION_CACHE_PREFIX = "llmcache:v1:"
+GENERATION_CACHE_PREFIX = "llmcache:v2:"
 logger = logging.getLogger(__name__)
 
 
@@ -30,6 +30,7 @@ def build_generation_cache_key(
     upstream_artifact_hashes: Mapping[str, str],
     user_instruction_hash: str,
     output_contract_version: str,
+    input_identity: Mapping | None = None,
 ) -> str:
     payload = {
         "prompt_version": prompt_version,
@@ -42,6 +43,7 @@ def build_generation_cache_key(
         "upstream_artifact_hashes": dict(sorted(upstream_artifact_hashes.items())),
         "user_instruction_hash": user_instruction_hash,
         "output_contract_version": output_contract_version,
+        "input_identity": dict(input_identity or {}),
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()

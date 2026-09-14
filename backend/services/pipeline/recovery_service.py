@@ -149,11 +149,21 @@ async def recover_stuck_stages(db: AsyncSession) -> int:
                 ),
             }
         )
-        stage.quality_gate_status = "advisory"
-        stage.quality_gate_kind = "critic_findings"
+        from services.pipeline.tech_safety import (
+            analyze_local_technology_safety,
+            is_blocking_finding,
+        )
+
+        local = analyze_local_technology_safety(stage.type, stage.content or "", {})
+        findings.extend(item.to_payload() for item in local)
+        local_blocked = any(is_blocking_finding(item) for item in local)
+        stage.quality_gate_status = "blocked" if local_blocked else "advisory"
+        stage.quality_gate_kind = (
+            "technology_safety" if local_blocked else "critic_findings"
+        )
         stage.quality_gate_payload = {
             "stage": stage.type,
-            "kind": "critic_findings",
+            "kind": stage.quality_gate_kind,
             "findings": findings,
         }
         stage.quality_gate_failed_at = now

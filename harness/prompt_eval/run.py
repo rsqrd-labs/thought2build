@@ -3,8 +3,8 @@
 Usage:
     uv run python -m prompt_eval.run --version asdd-v1.9.0 --baseline asdd-v1.8.0
 
-Produces a markdown delta report with per-grader pass-rate delta, per-stage
-cost, and per-stage grading latency. Exit code 1 means at least one grader
+Grades committed historical fixtures, NOT outputs from candidate prompts.
+Cost is zero because no generation happens. See live.py for candidate evaluation. Exit code 1 means at least one grader
 regressed against the committed baseline.
 """
 
@@ -195,7 +195,9 @@ def write_report(
     regressions: list[str],
 ) -> None:
     lines: list[str] = [
-        "# Prompt Eval Report",
+        "# Committed-fixture grader regression report",
+        "",
+        "This report does not evaluate changed prompts. Live candidate evidence is required separately.",
         "",
         f"- Version: `{version}`",
         f"- Baseline: `{baseline}`",
@@ -253,6 +255,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     snapshots = load_snapshots(args.golden_root)
+    for snapshot in snapshots:
+        declared = json.loads((snapshot.root / BASELINE_FILE).read_text()).get(
+            "version"
+        )
+        if declared != args.baseline:
+            raise ValueError(
+                f"{snapshot.name}: requested baseline {args.baseline} != fixture {declared}"
+            )
     runs = tuple(run_snapshot(snapshot) for snapshot in snapshots)
     regressions = _collect_regressions(runs)
     write_report(
