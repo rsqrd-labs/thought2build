@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -46,6 +46,7 @@ from models import (
 )
 from services.integrations import github_install_service
 from services.integrations.github_api_client import (
+    ISSUES_FETCH_CAP,
     make_app_github_client,
     make_shared_async_client,
 )
@@ -54,7 +55,10 @@ from services.integrations.github_app_auth import (
     make_token_provider,
 )
 from services.integrations.push_repo import find_live_pushes_for_event
-from services.observability import GITHUB_RECONCILE_LAG_SECONDS
+from services.observability import (
+    GITHUB_RECONCILE_LAG_SECONDS,
+    GITHUB_WEBHOOK_REPLAYED_TOTAL,
+)
 from services.security.sanitizer import sanitize_text
 
 GITHUB_PROVIDER = "github"
@@ -324,7 +328,22 @@ def _apply_done(
 ) -> bool:
     """Complete a task. Out-of-order gated on ``synced_at``; allows a
     ``manual`` → ``pr_merge`` upgrade but never a downgrade. Returns True only on
-    a fresh open→done transition (for the audit row)."""
+    a fresh open→done transition (for the audit row).
+
+    Attribution is settled BEFORE the freshness gate, deliberately. Merging a PR
+    emits two deliveries: ``issues.closed`` (fast lane) and
+    ``pull_request.closed`` with ``merged`` (bulk lane). The issue event normally
+    wins that race, and GitHub stamps the issue's ``updated_at`` at or *after*
+    the PR's ``merged_at`` — so gating first made the authoritative ``pr_merge``
+    event look stale and the documented upgrade never fired. ``pr_merge`` is
+    monotonic (it is never downgraded and never re-derived), so applying it out
+    of order is safe in a way that ``state``/``synced_at`` are not; those stay
+    behind the gate.
+    """
+    if done_via == "pr_merge" and task.state == "done" and task.done_via != "pr_merge":
+        # Only ever upgrades an existing completion — never records an
+        # attribution for a task that is still open.
+        task.done_via = "pr_merge"
     if task.synced_at is not None and event_ts < task.synced_at:
         return False
     task.synced_at = event_ts
@@ -333,8 +352,6 @@ def _apply_done(
         task.done_at = datetime.now(UTC)
         task.done_via = done_via
         return True
-    if done_via == "pr_merge" and task.done_via != "pr_merge":
-        task.done_via = "pr_merge"  # upgrade attribution; not a new completion
     return False
 
 
@@ -500,6 +517,12 @@ async def _mark_processed(db: AsyncSession, delivery_id: str) -> None:
         return
     now = datetime.now(UTC)
     row.processed_at = now
+    # The payload is retained only so an unprocessed delivery can be replayed;
+    # once applied it is dead weight. Clearing it here keeps the column holding
+    # just the handful of stuck rows rather than every delivery for the 30-day
+    # retention window, and keeps the row consistent with the replay filter
+    # (``processed_at IS NULL AND payload IS NOT NULL``).
+    row.payload = None
     received = row.received_at
     if received is not None:
         if received.tzinfo is None:
@@ -588,12 +611,19 @@ async def _run_backfill(db: AsyncSession, push_id: str, client: Any) -> None:
         ).scalars()
     )
     if not tasks:
-        push.last_inbound_sync_at = datetime.now(UTC)
+        now = datetime.now(UTC)
+        push.last_inbound_sync_at = now
+        push.last_full_backfill_at = now
         push.last_inbound_sync_error = None
         await db.commit()
         return
     by_number = {t.external_issue_number: t for t in tasks}
-    since = _last_synced_iso(tasks)
+    # Captured BEFORE the fetch so an issue updated while the call is in flight
+    # is re-pulled by the next sweep rather than skipped by a watermark that has
+    # already moved past it.
+    sweep_started_at = datetime.now(UTC)
+    previous_watermark = _as_utc(push.last_full_backfill_at)
+    since = _backfill_since(push)
 
     if client is not None:
         issues = await client.list_issues(push.repo_full_name, state="all", since=since)
@@ -647,21 +677,111 @@ async def _run_backfill(db: AsyncSession, push_id: str, client: Any) -> None:
     # Completion is observable even when GitHub is already up to date. This is
     # separate from each task's event-time ``synced_at`` ordering cursor.
     push.last_inbound_sync_at = datetime.now(UTC)
+    # Only a sweep that actually completed may advance the watermark — an early
+    # return or a raised error must leave the window open for the next attempt.
+    push.last_full_backfill_at = _resolved_watermark(
+        issues,
+        push=push,
+        sweep_started_at=sweep_started_at,
+        previous_watermark=previous_watermark,
+    )
     push.last_inbound_sync_error = None
     await db.commit()
 
 
-def _last_synced_iso(tasks: list[IntegrationPushTask]) -> str | None:
-    """The most recent ``synced_at`` across a push's tasks, as an ISO string —
-    the ``since`` cursor so backfill only pulls rows updated after the last
-    reconcile. ``None`` (no prior sync) pulls the full history."""
-    stamps = [t.synced_at for t in tasks if t.synced_at is not None]
-    if not stamps:
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Normalise a stored timestamp to tz-aware UTC, or ``None``."""
+    if value is None:
         return None
-    latest = max(stamps)
-    if latest.tzinfo is None:
-        latest = latest.replace(tzinfo=UTC)
-    return latest.astimezone(UTC).isoformat()
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _resolved_watermark(
+    issues: list[dict[str, Any]],
+    *,
+    push: IntegrationPush,
+    sweep_started_at: datetime,
+    previous_watermark: datetime | None,
+) -> datetime:
+    """Where the next sweep should resume from after this one.
+
+    ``list_issues`` truncates SILENTLY at :data:`ISSUES_FETCH_CAP`. Advancing the
+    watermark to ``sweep_started_at`` after a truncated fetch would skip every
+    issue past the cap permanently — the same class of silent loss the watermark
+    was introduced to fix, just harder to notice. A truncated sweep therefore
+    resumes from the newest row it actually saw.
+
+    The max is taken over EVERY returned row, pull requests included. GitHub
+    returns PRs from the issues endpoint and the caller filters them afterwards;
+    the cursor is about GitHub's update ordering, not about which rows we cared
+    about, and a final page that happens to be all PRs would otherwise
+    under-advance or produce no cursor at all.
+
+    ``since`` is inclusive, so resuming at that row's own timestamp re-reads it —
+    harmless, and it guarantees no gap.
+
+    One degenerate case has to be caught: if the cap is full of rows that all
+    share the current watermark's timestamp, the resume point equals the
+    watermark and the sweep re-pulls the identical page every tick forever,
+    burning API budget and never progressing. That is worse than a skipped
+    window, so it takes the full window and says so loudly.
+    """
+    if len(issues) < ISSUES_FETCH_CAP:
+        return sweep_started_at
+
+    stamps = [
+        parsed
+        for parsed in (_parse_ts(issue.get("updated_at")) for issue in issues)
+        if parsed is not None
+    ]
+    newest = max(stamps) if stamps else None
+    if newest is not None and (
+        previous_watermark is None or newest > previous_watermark
+    ):
+        logger.warning(
+            "github.backfill.truncated_resuming",
+            push_id=str(push.id),
+            rows=len(issues),
+            resume_at=newest.isoformat(),
+        )
+        return newest
+
+    logger.error(
+        "github.backfill.cursor_stalled",
+        push_id=str(push.id),
+        rows=len(issues),
+        detail=(
+            "a full page of issues shares the current cursor timestamp; "
+            "advancing the full window to avoid re-pulling it every tick"
+        ),
+    )
+    return sweep_started_at
+
+
+def _backfill_since(push: IntegrationPush) -> str | None:
+    """The ``since`` cursor for a push's issue sweep, or ``None`` for full history.
+
+    This is the push-level ``last_full_backfill_at`` watermark — the start of the
+    last sweep that actually completed — and NOT a function of per-task
+    ``synced_at``.
+
+    The per-task derivation this replaced took ``max(synced_at)`` across the
+    push's tasks and used it as a push-wide floor. GitHub's ``since`` returns
+    only issues updated at or after the cursor, so any issue whose last update
+    predated the most recently reconciled task was excluded from every future
+    sweep: an issue closed at 10:00 whose webhook was lost, followed by an
+    unrelated issue closed and reconciled at 12:00, left the first one
+    permanently invisible to the very mechanism meant to recover it. ``min``
+    would not have fixed it either (a task that never reconciled has no
+    ``synced_at`` to contribute), and falling back to ``None`` in that case
+    means a full 20-page history pull on essentially every drift tick.
+    """
+    watermark = _as_utc(push.last_full_backfill_at)
+    if watermark is None:
+        return None
+    return watermark.isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +802,8 @@ async def reconcile_drift(
        gone is a crashed export; mark it 'failed' so the repo is not permanently
        locked out of re-export by the live partial index.
     2. Catch missed events: enqueue ``backfill_repo`` for each completed push.
+    3. Inbox replay: re-dispatch webhook deliveries that were recorded but never
+       processed (see :func:`_replay_unprocessed_deliveries`).
     """
     if is_job_alive is None:
         is_job_alive = _arq_job_alive_checker((ctx or {}).get("redis"))
@@ -733,7 +855,90 @@ async def _run_reconcile_drift(
     )
     for push in completed:
         await _enqueue(enqueue_fn, "backfill_repo", str(push.id))
+
+    await _replay_unprocessed_deliveries(db, enqueue_fn)
     return swept
+
+
+# How long a delivery may sit unprocessed before the sweep replays it. This must
+# comfortably exceed the drift cron's own period (15 min) plus a job's retry and
+# backoff budget — the replay carries no arq ``job_id``, so a premature sweep
+# would queue a second copy underneath a job that is merely slow or mid-retry.
+_REPLAY_AFTER_SECONDS = 3600
+# Bound the work one tick may schedule; a large backlog drains over several ticks
+# rather than flooding the queue in one go.
+_REPLAY_BATCH = 100
+# Give up after this many replays. Without it, a delivery that can NEVER succeed
+# (a handler bug, an installation GitHub now 404s) is re-enqueued every tick
+# forever, burning a full retry budget each time — and because the sweep is
+# batched and ordered oldest-first, enough such rows fill the batch and starve
+# the newer, recoverable deliveries this whole mechanism exists to rescue. An
+# exhausted row keeps ``processed_at IS NULL`` so it stays visible to the
+# operator query in RUNBOOK §12.13; recovery is a workspace backfill.
+_MAX_REPLAY_ATTEMPTS = 3
+
+
+async def _replay_unprocessed_deliveries(db: AsyncSession, enqueue_fn: Any) -> int:
+    """Re-dispatch verified deliveries that were recorded but never applied.
+
+    The ingress commits the ``github_webhook_events`` dedup row on *receipt*, so
+    a delivery whose job never ran — bulk lane down long enough for the arq job
+    to expire, a worker killed past its retry budget, a dead-letter nobody
+    replayed — is answered ``{"status": "duplicate"}`` on GitHub's redelivery and
+    disappears with no trace. ``processed_at`` recorded exactly that condition
+    and nothing ever read it. This is the reader, mirroring the billing inbox's
+    replay lane.
+
+    Replay is safe because dispatch is idempotent: the handlers are gated on
+    ``synced_at`` and dedup on ``(workspace_id, external_ref)``, and re-applying
+    a state a task already holds is a no-op. Rows with no stored payload (written
+    before the column existed, or a body that would not parse) cannot be replayed
+    and are left alone — they are visible as a persistently NULL
+    ``processed_at``. Routing goes through the same job names the ingress uses,
+    so ``issues`` still lands on the fast lane.
+    """
+    cutoff = datetime.now(UTC) - timedelta(seconds=_REPLAY_AFTER_SECONDS)
+    rows = list(
+        (
+            await db.execute(
+                select(GitHubWebhookEvent)
+                .where(
+                    GitHubWebhookEvent.processed_at.is_(None),
+                    GitHubWebhookEvent.received_at < cutoff,
+                    GitHubWebhookEvent.payload.isnot(None),
+                    GitHubWebhookEvent.replay_count < _MAX_REPLAY_ATTEMPTS,
+                )
+                .order_by(GitHubWebhookEvent.received_at)
+                .limit(_REPLAY_BATCH)
+            )
+        ).scalars()
+    )
+    replayed = 0
+    for row in rows:
+        job = (
+            "reconcile_issue_event" if row.event_type == "issues" else "reconcile_event"
+        )
+        await _enqueue(
+            enqueue_fn, job, row.delivery_id, row.event_type, json.dumps(row.payload)
+        )
+        row.replay_count = (row.replay_count or 0) + 1
+        replayed += 1
+        logger.warning(
+            "github.reconcile.delivery_replayed",
+            delivery_id=row.delivery_id,
+            event_type=row.event_type,
+            attempt=row.replay_count,
+        )
+        if row.replay_count >= _MAX_REPLAY_ATTEMPTS:
+            logger.error(
+                "github.reconcile.delivery_replay_exhausted",
+                delivery_id=row.delivery_id,
+                event_type=row.event_type,
+            )
+    if replayed:
+        await db.commit()
+        GITHUB_WEBHOOK_REPLAYED_TOTAL.inc(replayed)
+    return replayed
 
 
 def _arq_job_alive_checker(redis: Any) -> Any:

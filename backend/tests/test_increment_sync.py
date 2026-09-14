@@ -518,9 +518,11 @@ async def test_task_ref_migration_fast_path_skips_github(
 async def test_task_ref_migration_collision_and_missing_title(
     session: AsyncSession,
 ) -> None:
-    """Defensive paths: two issues with the same title collide on the stable key
-    (first wins, the rest stay legacy — never violating uq_push_task_ref), and an
-    issue whose title cannot be recovered is left on its legacy ref."""
+    """Defensive paths: two issues with the same title migrate onto DISTINCT
+    stable keys (lowest issue number keeps the unsalted ref, the next takes
+    occurrence 1 — mirroring parse_tasks' document-order salting, and never
+    violating uq_push_task_ref), and an issue whose title cannot be recovered is
+    left on its legacy ref."""
     from services.integrations.task_ref_migration import (
         is_legacy_task_ref,
         migrate_legacy_task_refs,
@@ -554,7 +556,7 @@ async def test_task_ref_migration_collision_and_missing_title(
     ]
     try:
         migrated = await migrate_legacy_task_refs(session, push.id, stub, "octo/app")
-        assert migrated == 1  # only the first "Same title" row migrated
+        assert migrated == 2  # both "Same title" rows migrate, onto distinct keys
 
         rows = {
             r.external_issue_number: r.task_ref
@@ -566,8 +568,12 @@ async def test_task_ref_migration_collision_and_missing_title(
                 )
             ).scalars()
         }
+        # Issues are created in document order, so ascending issue number is
+        # ascending occurrence: 101 is the first "Same title", 102 the second.
         assert rows[101] == compute_task_ref("Same title")
-        assert is_legacy_task_ref(rows[102])  # collided → left legacy
+        assert rows[102] == compute_task_ref("Same title", occurrence=1)
+        assert rows[101] != rows[102]
+        assert not is_legacy_task_ref(rows[102])
         assert rows[103] == "T-003"  # unrecoverable → left legacy
     finally:
         await _teardown(session, seeded)

@@ -910,6 +910,12 @@ GITHUB_WEBHOOK_DEDUPED_TOTAL = Counter(
     "duplicates, by event type.",
     labelnames=["event_type"],
 )
+GITHUB_WEBHOOK_REPLAYED_TOTAL = Counter(
+    "thought2build_github_webhook_replayed_total",
+    "GitHub webhook deliveries re-dispatched by the inbox sweep because they "
+    "were recorded on receipt but never processed. Sustained non-zero means "
+    "deliveries are being dropped between the ingress and the worker.",
+)
 GITHUB_WEBHOOK_FAILED_TOTAL = Counter(
     "thought2build_github_webhook_failed_total",
     "GitHub webhook deliveries rejected before dispatch, by error_type.",

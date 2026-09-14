@@ -1697,6 +1697,84 @@ ignored). This is the two-secret window.
 old value and revert the GitHub App secret; the previous slot already accepts
 it, so recovery is immediate.
 
+### 12.13 Webhook inbox replay (dropped deliveries)
+
+The ingress commits a `github_webhook_events` dedup row on **receipt**, before
+the worker runs. That is deliberate (it is what makes GitHub's at-least-once
+retries safe), but it means a delivery whose job never executed — bulk lane down
+long enough for the arq job to expire, a worker hard-killed past its retry
+budget, a dead-letter nobody replayed — is answered `{"status":"duplicate"}` on
+GitHub's redelivery. Without a replay the event is gone.
+
+`reconcile_drift` therefore sweeps the inbox each tick and re-dispatches any row
+still unprocessed **1 hour** after receipt (batched at 100/tick, oldest first,
+and at most **3 attempts** per delivery). Replay is safe because dispatch is
+idempotent: transitions are gated on `synced_at` and ideas dedup on
+`(workspace_id, external_ref)`.
+
+The attempt bound matters: a delivery that can never succeed (a handler bug, an
+installation GitHub now 404s) would otherwise be re-enqueued every tick forever,
+and because the sweep is batched oldest-first, enough such rows would fill the
+batch and starve the newer deliveries the sweep exists to rescue. An exhausted
+row logs `github.reconcile.delivery_replay_exhausted` and stops being retried —
+it stays `processed_at IS NULL`, so the query below still shows it.
+
+A delivery's payload is cleared the moment it is processed, so this column holds
+only the rows that are actually stuck, not every delivery for the retention
+window.
+
+**Alert on this** — it means deliveries are being lost between the API and the
+worker:
+
+```bash
+curl -s -H "Authorization: Bearer $METRICS_TOKEN" "$API_URL/metrics" \
+  | grep thought2build_github_webhook_replayed_total
+```
+
+A one-off bump after a worker restart is expected. Sustained growth means the
+bulk lane is not keeping up (check `specforge_worker_queue_depth` and
+`_oldest_age_seconds`) or jobs are dead-lettering to `gh:deadletter`.
+
+To see what is currently stuck:
+
+```sql
+SELECT delivery_id, event_type, received_at
+FROM github_webhook_events
+WHERE processed_at IS NULL AND received_at < now() - interval '15 minutes'
+ORDER BY received_at
+LIMIT 50;
+```
+
+Add `replay_count` to that select to separate the two terminal cases. Rows with
+`payload IS NULL` were never replayable (written before the payload column
+existed, or a body that would not parse as a JSON object); rows with
+`replay_count >= 3` exhausted their attempts. **Both need a manual recovery** —
+`POST /workspaces/{id}/sync/backfill` for the affected workspace, which now has
+a correct `since` cursor and will pull the missed state.
+
+### 12.14 First drift tick after deploying 0048
+
+Every existing push starts with `last_full_backfill_at = NULL`, so the first
+`reconcile_drift` tick after the deploy sends `since=None` and pulls full issue
+history for each of them — one time only. Expect a visible bump in GitHub API
+consumption on that tick (the per-installation governor absorbs it; a throttle
+requeues rather than fails). Steady state afterwards is strictly cheaper than the
+old per-task cursor. Do not mistake the bump for a regression.
+
+### 12.15 Reconnecting after an uninstall
+
+Uninstalling the App (or a local revoke) detaches its pushes — `installation_id`
+is cleared, and `detached_installation_id` retains GitHub's numeric id.
+Re-installing the App **on the same account, by the same Thought2Build user**
+re-adopts them automatically and inbound sync resumes; look for
+`github_install.pushes_readopted` in the logs.
+
+Re-adopted pushes stay `stale` on purpose — that clears on the next successful
+export/resync, which is what actually re-verifies the App can still reach the
+repo. If a *different* user re-installs, adoption is deliberately skipped (it
+would sync the first user's workspaces under someone else's installation token);
+that workspace needs a fresh export from its owner.
+
 ---
 
 ### §12.3 — Installation-Token Re-Mint

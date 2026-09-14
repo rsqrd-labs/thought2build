@@ -118,6 +118,22 @@ class IntegrationPush(Base):
     # Machine-readable result of the last inbound check. Null means success;
     # values are a deliberately small product contract, never raw GitHub text.
     last_inbound_sync_error: Mapped[str | None] = mapped_column(Text)
+    # Watermark for backfill's ``since`` cursor: the instant the last SUCCESSFUL
+    # full issue sweep started. Deliberately not ``last_inbound_sync_at`` — that
+    # is stamped by a single-issue webhook reconcile, and using it would skip
+    # every issue whose update predates that one event, which is precisely the
+    # class of miss backfill exists to recover.
+    last_full_backfill_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True),
+    )
+    # GitHub's numeric installation id, retained when an uninstall detaches this
+    # push (``installation_id`` is NULLed because the install row is deleted).
+    # Inbound reconcile resolves pushes by joining ``github_installations``, so
+    # without this the push is unreachable forever; re-installing the App on the
+    # same account re-adopts its own former pushes through this column.
+    detached_installation_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         nullable=False,

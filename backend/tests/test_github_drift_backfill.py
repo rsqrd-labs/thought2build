@@ -233,6 +233,13 @@ async def test_drift_leaves_matching_push_untouched(
 
 
 class _StubIssuesClient:
+    """Stub that HONOURS ``since`` the way GitHub does.
+
+    It used to record the cursor and return every issue regardless, which made
+    the whole class of "backfill sent a cursor that excluded the issue it was
+    supposed to recover" invisible to the suite.
+    """
+
     def __init__(self, issues: list[dict[str, Any]]) -> None:
         self._issues = issues
         self.calls: list[dict[str, Any]] = []
@@ -241,7 +248,18 @@ class _StubIssuesClient:
         self, repo: str, *, state: str = "all", since: str | None = None
     ) -> list[dict[str, Any]]:
         self.calls.append({"repo": repo, "state": state, "since": since})
-        return self._issues
+        if since is None:
+            return list(self._issues)
+        cutoff = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        kept = []
+        for issue in self._issues:
+            updated = issue.get("updated_at")
+            if not isinstance(updated, str):
+                kept.append(issue)
+                continue
+            if datetime.fromisoformat(updated.replace("Z", "+00:00")) >= cutoff:
+                kept.append(issue)
+        return kept
 
 
 async def _make_task(

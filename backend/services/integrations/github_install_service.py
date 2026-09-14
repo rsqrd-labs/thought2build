@@ -200,9 +200,13 @@ async def build_identity_verify_url(
         {
             "client_id": settings.github_app_client_id,
             "state": state,
-            # Force a fresh authorization so a stale cached grant can't satisfy
-            # the proof-of-control check for an installation the user no longer
-            # administers.
+            # Keep an unauthenticated visitor from creating a brand-new GitHub
+            # account mid-flow; the install being verified belongs to an existing
+            # account by definition. This is NOT a re-authorization control (it
+            # has no bearing on cached grants) — freshness comes from
+            # `user_can_access_installation`, which calls /user/installations
+            # live and therefore reflects access as it stands right now, not
+            # whatever the user consented to previously.
             "allow_signup": "false",
         }
     )
@@ -420,6 +424,72 @@ async def upsert_installation(
     prior ``suspended_at`` so a previously-disconnected install becomes live
     again.
     """
+    row, created = await _persist_installation(
+        db, installation_id=installation_id, user_id=user_id, account=account
+    )
+    await db.flush()
+    # Re-adopt any pushes a previous uninstall of THIS installation detached, so
+    # reinstalling restores inbound sync instead of leaving the workspace
+    # permanently unreachable by webhook/backfill/resync.
+    #
+    # Best-effort, deliberately. This UPDATE takes row locks on
+    # ``integration_pushes``, and a worker export job commits repeatedly through
+    # those same rows — so it can block and, under the request path's statement
+    # timeout, fail. Binding the installation is the thing the user is waiting
+    # on and the thing everything else depends on; adoption is a convenience the
+    # next export/resync re-establishes anyway. It must never take the bind down
+    # with it.
+    #
+    # A SAVEPOINT, not a try/rollback: a full ``db.rollback()`` would discard the
+    # bind we just flushed AND expire every other object the caller holds in this
+    # session. The savepoint confines the failure to the adoption alone and
+    # leaves the outer transaction usable.
+    readopted = 0
+    try:
+        async with db.begin_nested():
+            readopted = await _readopt_detached_pushes(
+                db,
+                installation_row_id=row.id,
+                installation_id=installation_id,
+                user_id=user_id,
+            )
+    except Exception:
+        readopted = 0
+        logger.warning(
+            "github_install.readopt_failed installation_id=%s",
+            installation_id,
+            exc_info=True,
+        )
+    await db.commit()
+    await db.refresh(row)
+    if readopted:
+        logger.info(
+            "github_install.pushes_readopted installation_id=%s count=%d",
+            installation_id,
+            readopted,
+        )
+    github_audit(
+        GITHUB_AUDIT_INSTALLED,
+        installation_id=installation_id,
+        action="created" if created else "updated",
+        status="active",
+    )
+    return row
+
+
+async def _persist_installation(
+    db: AsyncSession,
+    *,
+    installation_id: int,
+    user_id: UUID,
+    account: InstallationAccount,
+) -> tuple[GitHubInstallation, bool]:
+    """Insert or update the install row, returning ``(row, created)``.
+
+    Extracted so the bind can be replayed on a clean transaction if the
+    best-effort push re-adoption has to be rolled back (the bind must survive an
+    adoption failure — see :func:`upsert_installation`).
+    """
     result = await db.execute(
         select(GitHubInstallation).where(
             GitHubInstallation.installation_id == installation_id
@@ -442,15 +512,7 @@ async def upsert_installation(
         row.repository_selection = account.repository_selection
         row.user_id = user_id
         row.suspended_at = None
-    await db.commit()
-    await db.refresh(row)
-    github_audit(
-        GITHUB_AUDIT_INSTALLED,
-        installation_id=installation_id,
-        action="created" if created else "updated",
-        status="active",
-    )
-    return row
+    return row, created
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +559,9 @@ async def revoke_installation(
     row = result.scalar_one_or_none()
     if row is None or row.user_id != user_id:
         return False
-    await _detach_and_stale_pushes(db, row.id)
+    # Record the numeric id alongside the detach so re-connecting this same
+    # installation re-adopts these pushes, exactly as it does after an uninstall.
+    await _detach_and_stale_pushes(db, row.id, installation_id=row.installation_id)
     await db.delete(row)
     await db.commit()
     return True
@@ -539,7 +603,7 @@ async def apply_installation_event(
         row.suspended_at = None
         await db.commit()
     elif action == "deleted":
-        await _detach_and_stale_pushes(db, row.id)
+        await _detach_and_stale_pushes(db, row.id, installation_id=installation_id)
         await db.delete(row)
         await db.commit()
         github_audit(
@@ -613,12 +677,25 @@ async def _mark_pushes_stale(db: AsyncSession, installation_row_id: UUID) -> Non
     )
 
 
-async def _detach_and_stale_pushes(db: AsyncSession, installation_row_id: UUID) -> None:
+async def _detach_and_stale_pushes(
+    db: AsyncSession, installation_row_id: UUID, *, installation_id: int
+) -> None:
     """Stale + detach pushes so the install row can be deleted (no FK cascade).
 
     ``integration_pushes.installation_id`` has no ON DELETE rule, so the rows are
     set ``stale`` and their ``installation_id`` cleared before the install row is
-    removed. drift/reconcile still works via the immutable ``repo_id``.
+    removed.
+
+    Detaching alone used to strand them permanently. Inbound reconcile resolves a
+    delivery through ``find_live_pushes_for_event``, which INNER JOINs
+    ``github_installations`` on ``IntegrationPush.installation_id`` — a NULL
+    joins to nothing, so no webhook could reach these pushes again, backfill
+    returned early on the missing installation, and resync marked the push
+    ``failed``. Re-installing the App did not help either, because the new row
+    gets a fresh UUID primary key and nothing re-attached the old pushes. So the
+    GitHub-side numeric id is recorded in ``detached_installation_id``, which is
+    what :func:`_readopt_detached_pushes` matches on when the same installation
+    comes back.
     """
     await db.execute(
         update(IntegrationPush)
@@ -626,10 +703,46 @@ async def _detach_and_stale_pushes(db: AsyncSession, installation_row_id: UUID) 
             IntegrationPush.installation_id == installation_row_id,
             IntegrationPush.status != "failed",
         )
-        .values(status="stale", installation_id=None)
+        .values(
+            status="stale",
+            installation_id=None,
+            detached_installation_id=installation_id,
+        )
     )
     await db.execute(
         update(IntegrationPush)
         .where(IntegrationPush.installation_id == installation_row_id)
-        .values(installation_id=None)
+        .values(installation_id=None, detached_installation_id=installation_id)
     )
+
+
+async def _readopt_detached_pushes(
+    db: AsyncSession,
+    *,
+    installation_row_id: UUID,
+    installation_id: int,
+    user_id: UUID,
+) -> int:
+    """Re-attach pushes this same installation left behind when it was removed.
+
+    Scoped to ``user_id`` as well as the numeric installation id, deliberately:
+    an organization can be re-installed by a *different* admin, and adopting the
+    first user's pushes would let their workspaces sync under someone else's
+    installation token. Same-user scoping restores exactly the uninstall →
+    reinstall case and opens no cross-tenant path.
+
+    Adopted rows keep ``status='stale'``. Staleness here means "the connection
+    was interrupted" and is cleared by the next successful export/resync, which
+    is also what re-verifies the App can still reach the repo — inventing a
+    ``completed`` status from a webhook would assert something unverified.
+    """
+    result = await db.execute(
+        update(IntegrationPush)
+        .where(
+            IntegrationPush.installation_id.is_(None),
+            IntegrationPush.detached_installation_id == installation_id,
+            IntegrationPush.user_id == user_id,
+        )
+        .values(installation_id=installation_row_id, detached_installation_id=None)
+    )
+    return int(result.rowcount or 0)

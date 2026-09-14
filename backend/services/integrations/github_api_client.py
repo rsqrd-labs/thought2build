@@ -39,6 +39,13 @@ import httpx
 logger = logging.getLogger(__name__)
 
 GITHUB_API_BASE = "https://api.github.com"
+
+# Issue-listing pagination bounds. Exported because ``list_issues`` truncates
+# silently at the cap: any caller holding a durable cursor has to know the exact
+# number of rows that means "there may be more" (see ``list_issues``).
+ISSUES_PAGE_SIZE = 100
+ISSUES_MAX_PAGES = 20
+ISSUES_FETCH_CAP = ISSUES_PAGE_SIZE * ISSUES_MAX_PAGES
 _GITHUB_ACCEPT = "application/vnd.github+json"
 
 # Bounded retries for a stale-SHA 409 on a content write (T-276): refetch the
@@ -772,7 +779,7 @@ class GitHubAPIClient:
         *,
         state: str = "all",
         since: str | None = None,
-        max_pages: int = 20,
+        max_pages: int = ISSUES_MAX_PAGES,
     ) -> list[dict[str, Any]]:
         """GET /repos/{owner}/{repo}/issues — paginated, for backfill (T-273).
 
@@ -781,12 +788,18 @@ class GitHubAPIClient:
         those out. ``since`` is an ISO-8601 timestamp to fetch only rows updated
         after the last sync. Pagination is bounded by ``max_pages`` as a safety
         cap.
+
+        The cap is SILENT — a truncated result is indistinguishable from a
+        complete one by inspecting the list alone. A caller that advances a
+        durable cursor on the strength of this call must therefore compare its
+        result length against :data:`ISSUES_FETCH_CAP` and resume from the last
+        row it actually saw, or it will skip everything past the cap forever.
         """
         issues: list[dict[str, Any]] = []
         for page in range(1, max_pages + 1):
             query: dict[str, str | int] = {
                 "state": state,
-                "per_page": 100,
+                "per_page": ISSUES_PAGE_SIZE,
                 "page": page,
                 "sort": "updated",
                 "direction": "asc",
@@ -805,7 +818,7 @@ class GitHubAPIClient:
             if not isinstance(batch, list) or not batch:
                 break
             issues.extend(batch)
-            if len(batch) < 100:
+            if len(batch) < ISSUES_PAGE_SIZE:
                 break
         return issues
 

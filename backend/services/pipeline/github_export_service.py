@@ -58,6 +58,7 @@ from uuid import UUID
 
 import httpx
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_shared_redis
@@ -93,7 +94,7 @@ from services.integrations.github_governor import (
     make_governor,
 )
 from services.integrations.task_issue_reconcile import retire_obsolete_task_issues
-from services.integrations.task_parser import ParsedTask, compute_task_ref, parse_tasks
+from services.integrations.task_parser import ParsedTask, parse_tasks
 from services.integrations.task_ref_migration import migrate_legacy_task_refs
 from services.observability import (
     GITHUB_AUDIT_EXPORT_COMPLETED,
@@ -364,28 +365,82 @@ async def prepare_export_push(
     await _load_workspace(db, workspace_id, user_id)
     await _load_finalised_stages(db, workspace_id)
 
-    result = await db.execute(
-        select(IntegrationPush).where(
-            IntegrationPush.workspace_id == workspace_id,
-            IntegrationPush.provider == GITHUB_PROVIDER,
-        )
-    )
-    push = result.scalar_one_or_none()
-    if push is None:
-        push = IntegrationPush(
-            workspace_id=workspace_id,
-            user_id=user_id,
-            provider=GITHUB_PROVIDER,
-            status="pending",
-        )
-        db.add(push)
-    else:
-        push.status = "pending"
+    # Newest-first + first(), never scalar_one_or_none(): migration 0016 dropped
+    # the (workspace_id, provider) unique constraint in favour of a partial index
+    # on (workspace_id, repo_id), and a first export inserts with repo_id NULL —
+    # which Postgres treats as distinct, so two racing submits could both insert.
+    # 0048 adds the missing guarantee, but this read must stay tolerant of rows
+    # that predate it (and matches find_workspace_live_push / list_user_live_exports,
+    # which already resolve newest-first).
+    push = await _claim_push_row(db, workspace_id, user_id)
     push.installation_id = installation.id
+    # A push previously detached by an uninstall is being re-bound now, so its
+    # re-adoption marker is spent; leaving it set would point at an installation
+    # that no longer owns this row.
+    push.detached_installation_id = None
     push.export_mode = export_mode
     await db.commit()
     await db.refresh(push)
     return push
+
+
+async def _claim_push_row(
+    db: AsyncSession,
+    workspace_id: UUID,
+    user_id: UUID,
+) -> IntegrationPush:
+    """Return the workspace's GitHub push row, creating one on a first export.
+
+    Newest-first + ``first()``, never ``scalar_one_or_none()``: migration 0016
+    dropped the ``(workspace_id, provider)`` unique constraint in favour of a
+    partial index on ``(workspace_id, repo_id)``, and a first export inserts with
+    ``repo_id IS NULL`` — which Postgres treats as distinct, so two racing
+    submits could both insert and every later lookup then raised
+    ``MultipleResultsFound``, wedging the endpoint at 500 permanently. Migration
+    0048 adds the missing guarantee, but this read stays tolerant of rows written
+    before it.
+
+    With the index in place the race resolves the other way: the losing INSERT
+    would raise ``IntegrityError``. The insert is therefore an
+    ``ON CONFLICT DO NOTHING`` — a losing racer writes nothing and simply re-reads
+    the winner's row. An ORM flush is deliberately NOT used for this: a failed
+    flush poisons the whole Session (a SAVEPOINT protects the database state but
+    not SQLAlchemy's unit-of-work bookkeeping), so the caller would be left
+    unable to run any further statement — which is exactly the class of failure
+    ``_write_push_status`` had to be hardened against. The conflict form keeps
+    the transaction clean.
+    """
+    push = await _select_push_row(db, workspace_id)
+    if push is None:
+        await db.execute(
+            pg_insert(IntegrationPush)
+            .values(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                provider=GITHUB_PROVIDER,
+                status="pending",
+            )
+            .on_conflict_do_nothing()
+        )
+        push = await _select_push_row(db, workspace_id)
+        if push is None:  # pragma: no cover - the row was just inserted or existed
+            raise GitHubAPIError(0, "could not claim a push row for this workspace")
+    push.status = "pending"
+    return push
+
+
+async def _select_push_row(
+    db: AsyncSession, workspace_id: UUID
+) -> IntegrationPush | None:
+    result = await db.execute(
+        select(IntegrationPush)
+        .where(
+            IntegrationPush.workspace_id == workspace_id,
+            IntegrationPush.provider == GITHUB_PROVIDER,
+        )
+        .order_by(IntegrationPush.created_at.desc())
+    )
+    return result.scalars().first()
 
 
 async def run_export_push(
@@ -822,9 +877,15 @@ async def _sync_issues(
     await migrate_legacy_task_refs(db, push.id, client, repo)
     existing = await _load_existing_push_tasks(db, push.id)
     issue_numbers: dict[str, int] = dict(existing)
-    current_refs = {compute_task_ref(parsed.title) for parsed in tasks}
+    # One pass over the whole list so same-titled tasks get distinct refs; the
+    # retire set MUST come from the same call, or a disambiguated task looks
+    # obsolete on the next push and its issue is closed on every run.
+    # ``task_ref`` is resolved once by parse_tasks with same-title occurrences
+    # already disambiguated; the retire set MUST come from the same field, or a
+    # disambiguated task looks obsolete and its issue is closed on every push.
+    current_refs = {parsed.task_ref for parsed in tasks}
     for parsed in tasks:
-        ref = compute_task_ref(parsed.title)
+        ref = parsed.task_ref
         existing_number = existing.get(ref)
         # Agent-ready body + labels (T-277): the issue is an optimal agent prompt.
         if existing_number is not None:
@@ -847,6 +908,7 @@ async def _sync_issues(
                 )
             )
             await db.commit()
+            existing[ref] = number
             issue_numbers[ref] = number
     retired = await retire_obsolete_task_issues(db, client, repo, push.id, current_refs)
     for ref in retired:
@@ -1093,9 +1155,9 @@ async def _run_export(
     await migrate_legacy_task_refs(db, push.id, client, push.repo_full_name)
     existing_tasks = await _load_existing_push_tasks(db, push.id)
     tasks = parse_tasks(stages["tasks"].content or "")
-    current_refs = {compute_task_ref(parsed.title) for parsed in tasks}
+    current_refs = {parsed.task_ref for parsed in tasks}
     for parsed in tasks:
-        ref = compute_task_ref(parsed.title)
+        ref = parsed.task_ref
         existing_number = existing_tasks.get(ref)
         if existing_number is not None:
             await client.update_issue(
@@ -1121,6 +1183,7 @@ async def _run_export(
             # issue #50 of 100) preserves issues 1-49 — re-export resumes
             # from #50 without recreating them.
             await db.commit()
+            existing_tasks[ref] = number
 
     await retire_obsolete_task_issues(
         db, client, push.repo_full_name, push.id, current_refs
@@ -1194,31 +1257,60 @@ async def restore_push_status(
     failing the row would make ``find_live_push`` (``status <> 'failed'``)
     exclude it, silently dropping the workspace's bidirectional sync until a full
     re-export. Restoring the prior live status keeps the push live and re-syncable
-    on retry. Uses the same safe commit-with-rollback as ``_mark_push_failed``.
+    on retry. Uses the same safe write as ``_mark_push_failed``.
     """
-    try:
-        push.status = status
-        await db.commit()
-    except Exception:
-        logger.exception("github_export.restore_status_commit_error")
-        try:
-            await db.rollback()
-        except Exception:  # pragma: no cover - best-effort rollback
-            logger.exception("github_export.restore_status_rollback_error")
+    await _write_push_status(db, push, status, log_key="restore_status")
 
 
 async def _mark_push_failed(
     db: AsyncSession, push: IntegrationPush, *, status: str = "failed"
 ) -> None:
+    await _write_push_status(db, push, status, log_key="mark_failed")
+
+
+async def _write_push_status(
+    db: AsyncSession,
+    push: IntegrationPush,
+    status: str,
+    *,
+    log_key: str,
+) -> None:
+    """Persist a terminal/restored push status, surviving a poisoned session.
+
+    Both callers run on an error path, and one of those errors is a *flush*
+    failure (e.g. a ``uq_push_task_ref`` violation mid-issue-sync). A session
+    whose flush failed refuses every further statement until it is rolled back,
+    so the previous "set the attribute, commit, catch, roll back" shape lost the
+    write entirely: the commit raised ``PendingRollbackError``, the rollback then
+    discarded the pending status change, and the push was left ``pending``
+    forever. Rolling back FIRST discards only work that is already being
+    abandoned (the caller is unwinding), and leaves a clean transaction for the
+    one statement that actually matters.
+
+    The rollback is conditional on the session actually being poisoned
+    (``is_active`` is False only in SQLAlchemy's "partial rollback" state, i.e. a
+    flush failed and nothing else will run until it is cleared). On the ordinary
+    error paths the session is healthy and this behaves exactly as it always
+    did — one attribute set and one commit, with the caller's other in-session
+    state untouched.
+    """
+    if not db.sync_session.is_active:
+        # A failed flush poisoned the transaction. Clearing it discards only work
+        # the caller is already unwinding, and is the sole way the status write
+        # below can reach the database at all.
+        try:
+            await db.rollback()
+        except Exception:  # pragma: no cover - best-effort
+            logger.exception("github_export.%s_recovery_rollback_error", log_key)
     try:
         push.status = status
         await db.commit()
     except Exception:
-        logger.exception("github_export.mark_failed_commit_error")
+        logger.exception("github_export.%s_commit_error", log_key)
         try:
             await db.rollback()
         except Exception:  # pragma: no cover - best-effort rollback
-            logger.exception("github_export.mark_failed_rollback_error")
+            logger.exception("github_export.%s_rollback_error", log_key)
 
 
 # ---------------------------------------------------------------------------
@@ -1284,24 +1376,13 @@ async def _upsert_push_row(
     semantics at the application level: look the row up by
     ``(workspace_id, provider)`` and reset its status, otherwise insert. Repo
     fields (``repo_full_name`` / ``repo_url``) are left untouched on re-export.
+
+    Newest-first + ``first()`` for the same reason as
+    :func:`prepare_export_push`: nothing at the DB level guaranteed a single row
+    for the ``repo_id IS NULL`` case before migration ``0048``, so this read must
+    not raise ``MultipleResultsFound`` on a pre-existing pair.
     """
-    result = await db.execute(
-        select(IntegrationPush).where(
-            IntegrationPush.workspace_id == workspace_id,
-            IntegrationPush.provider == GITHUB_PROVIDER,
-        )
-    )
-    push = result.scalar_one_or_none()
-    if push is None:
-        push = IntegrationPush(
-            workspace_id=workspace_id,
-            user_id=user_id,
-            provider=GITHUB_PROVIDER,
-            status="pending",
-        )
-        db.add(push)
-    else:
-        push.status = "pending"
+    push = await _claim_push_row(db, workspace_id, user_id)
     await db.commit()
     await db.refresh(push)
     return push

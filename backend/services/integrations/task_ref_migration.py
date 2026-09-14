@@ -96,16 +96,21 @@ async def migrate_legacy_task_refs(
             title_by_number[number] = title
 
     # Seed the collision guard with refs already stable so a legacy row can never
-    # be repointed onto an in-use stable key (two same-titled tasks collide by
-    # design; we keep the first and leave the rest legacy rather than crash).
+    # be repointed onto an in-use stable key.
     taken_refs = {row.task_ref for row in rows if not is_legacy_task_ref(row.task_ref)}
     migrated = 0
-    for row in legacy:
+    # Same-titled tasks share a base ref and are disambiguated by their
+    # document-order ``occurrence`` (see ``task_parser.compute_task_ref``). The
+    # migration cannot read document order, but issue numbers ascend with it —
+    # issues are created in document order — so migrating lowest-number-first and
+    # taking the next free occurrence reproduces the same assignment. The first
+    # occurrence keeps the unsalted ref, matching ``parse_tasks``.
+    for row in sorted(legacy, key=lambda r: r.external_issue_number):
         title = title_by_number.get(row.external_issue_number)
         if not title:
             continue
-        stable = compute_task_ref(title)
-        if stable in taken_refs:
+        stable = _next_free_ref(title, taken_refs)
+        if stable is None:
             logger.warning(
                 "task_ref_migration.collision push_id=%s issue=%s",
                 str(push_id),
@@ -124,3 +129,21 @@ async def migrate_legacy_task_refs(
             migrated,
         )
     return migrated
+
+
+# A push cannot hold more same-titled tasks than it holds tasks, so this bound is
+# never reached in practice; it only stops a pathological input from looping.
+_MAX_TITLE_OCCURRENCES = 1000
+
+
+def _next_free_ref(title: str, taken_refs: set[str]) -> str | None:
+    """The lowest-occurrence stable ref for ``title`` not already in use.
+
+    Returns ``None`` when every occurrence slot is somehow taken, so the caller
+    leaves the row on its legacy ref rather than violating ``uq_push_task_ref``.
+    """
+    for occurrence in range(_MAX_TITLE_OCCURRENCES):
+        candidate = compute_task_ref(title, occurrence=occurrence)
+        if candidate not in taken_refs:
+            return candidate
+    return None

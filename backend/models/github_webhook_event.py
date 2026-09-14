@@ -27,8 +27,8 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID as PythonUUID
 
-from sqlalchemy import Text, func, text
-from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID
+from sqlalchemy import Integer, Text, func, text
+from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from models import Base
@@ -58,8 +58,32 @@ class GitHubWebhookEvent(Base):
         nullable=False,
         server_default=func.now(),
     )
-    # Set when the worker finishes reconciliation for this delivery.
+    # Set when the worker finishes reconciliation for this delivery. A row that
+    # still has NULL here well after ``received_at`` was recorded but never
+    # applied — see ``github_reconcile.replay_unprocessed_deliveries``.
     processed_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True),
         nullable=True,
+    )
+    # The verified delivery body, kept so an unprocessed row can be REPLAYED.
+    # The dedup row is committed on receipt, so without this a delivery that was
+    # recorded but never processed is answered "duplicate" on GitHub's
+    # redelivery and lost silently. Nullable: rows written before this column
+    # existed (and any row whose payload could not be stored) simply cannot be
+    # replayed, and the sweep skips them rather than failing.
+    # ``none_as_null`` so an absent payload is SQL NULL rather than the JSON
+    # value ``null`` — the replay sweep filters on ``payload IS NOT NULL``, and
+    # JSON ``null`` would sail straight through it.
+    payload: Mapped[dict | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
+    # How many times the inbox sweep has re-dispatched this delivery. Bounds the
+    # replay: a delivery that can never succeed (a handler bug, an installation
+    # GitHub 404s) would otherwise be re-enqueued every tick forever, and because
+    # the sweep is batched and oldest-first, a pile of such rows would fill the
+    # batch and starve the newer deliveries the sweep exists to rescue.
+    replay_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
     )
