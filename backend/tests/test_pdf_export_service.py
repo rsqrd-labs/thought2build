@@ -123,3 +123,43 @@ def test_no_network_url_fetcher_allows_data_urls() -> None:
         close = getattr(result, "close", None)
         if callable(close):
             close()
+
+
+def test_render_pdf_actually_routes_remote_images_through_the_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard must be wired into the real render, not merely defined.
+
+    Every other test in this file calls ``no_network_url_fetcher`` directly,
+    which is exactly why a regression went unnoticed: ``url_fetcher`` is an
+    ``HTML()`` constructor argument, and ``write_pdf(**options)`` swallowed it
+    without error, so the render fetched remote images for real. This test
+    drives a full render and asserts the fetcher was invoked and refused.
+    """
+    from services.pipeline import pdf_export_service as svc
+
+    fetcher = svc._no_network_fetcher()
+    original_fetch = fetcher.fetch
+    seen: list[str] = []
+    blocked: list[str] = []
+
+    def _spy(url: str, headers: object = None) -> object:
+        seen.append(url)
+        try:
+            return original_fetch(url, headers)
+        except _NoNetworkFetch:
+            blocked.append(url)
+            raise
+
+    monkeypatch.setattr(fetcher, "fetch", _spy)
+
+    exfil = "https://evil.example/exfil.png"
+    pdf = render_pdf(
+        workspace_name="Malicious Workspace",
+        stages={"spec": _FakeStage(f'# SPEC\n\n<img src="{exfil}">\n')},
+        coverage_label=None,
+    )
+
+    assert pdf.startswith(b"%PDF-")
+    assert exfil in seen, "remote <img> never reached the no-network fetcher"
+    assert blocked == [exfil], "remote <img> was not refused"

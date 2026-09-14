@@ -26,6 +26,7 @@ import logging
 import re
 import threading
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -119,8 +120,9 @@ class _NoNetworkFetch(Exception):
     """Raised when WeasyPrint tries to fetch a non-data URL during render."""
 
 
-def no_network_url_fetcher(url: str, **_: Any) -> Any:
-    """WeasyPrint url_fetcher that refuses every non-`data:` URL.
+@lru_cache(maxsize=1)
+def _no_network_fetcher() -> Any:
+    """Build the WeasyPrint URL fetcher that refuses every non-`data:` URL.
 
     Plan §18.4 requires that PDF rendering never trigger an outbound HTTP
     request: a malicious workspace must not be able to exfiltrate via an
@@ -128,25 +130,40 @@ def no_network_url_fetcher(url: str, **_: Any) -> Any:
     explicitly allowed so inline-encoded base64 assets in the template
     remain functional.
 
+    WeasyPrint 70 replaced the callable ``url_fetcher`` with a ``URLFetcher``
+    class and removed ``default_url_fetcher``; its internals also read
+    ``url_fetcher._fail_on_errors``, so a plain function is no longer a
+    usable fetcher. ``allowed_protocols`` is belt-and-braces — it re-checks
+    the scheme inside the delegated ``data:`` path. ``fail_on_errors`` keeps
+    its default on purpose: a blocked fetch must degrade to a missing image,
+    never to a failed export.
+
+    Built lazily and cached so the module stays importable on dev boxes
+    without the native cairo/pango libraries.
+
     `no_network` marker — keep this token in the source for the harness
     contract test that scans for the no-network guard.
     """
-    return _make_no_network_fetcher().fetch(url)
+    from weasyprint.urls import URLFetcher
+
+    class _NoNetworkURLFetcher(URLFetcher):
+        def fetch(self, url: str, headers: Any = None) -> Any:
+            if url.startswith("data:"):
+                return super().fetch(url, headers)
+            logger.warning("pdf_export_blocked_url_fetch url=%s", url[:120])
+            raise _NoNetworkFetch(f"Network fetch blocked: {url[:120]}")
+
+    return _NoNetworkURLFetcher(allowed_protocols=("data",))
 
 
-def _make_no_network_fetcher():
-    # WeasyPrint 70 expects a URLFetcher instance, including its error policy.
-    # Keep the import lazy so non-PDF workers do not require native libraries.
-    from weasyprint import URLFetcher
+def no_network_url_fetcher(url: str, **_: Any) -> Any:
+    """Fetch ``url`` under the no-network policy, or raise `_NoNetworkFetch`.
 
-    class DataOnlyFetcher(URLFetcher):
-        def fetch(self, url, headers=None):
-            if not url.startswith("data:"):
-                logger.warning("pdf_export_blocked_url_fetch url=%s", url[:120])
-                raise _NoNetworkFetch(f"Network fetch blocked: {url[:120]}")
-            return super().fetch(url, headers)
-
-    return DataOnlyFetcher(allowed_protocols={"data"}, allow_redirects=False)
+    Thin shim over `_no_network_fetcher` so the policy has exactly one
+    implementation. WeasyPrint itself is handed the fetcher *object*, never
+    this function.
+    """
+    return _no_network_fetcher().fetch(url)
 
 
 # Boundary-local sanitization of the *rendered* HTML (audit F1 / plan §1.0).
@@ -365,9 +382,10 @@ def _render_pdf_sync(html_text: str) -> bytes:
     from weasyprint import HTML
 
     _start = time.perf_counter()
-    pdf_bytes = HTML(string=html_text).write_pdf(
-        url_fetcher=_make_no_network_fetcher(),
-    )
+    # `url_fetcher` is an HTML() constructor argument. write_pdf() takes
+    # **options and silently swallows unknown keywords, so passing it there
+    # left this guard inert and every remote <img> was fetched for real.
+    pdf_bytes = HTML(string=html_text, url_fetcher=_no_network_fetcher()).write_pdf()
     # Observe render duration in the Prometheus histogram.  T-194.
     PDF_EXPORT_DURATION.observe(time.perf_counter() - _start)
     if not pdf_bytes:
