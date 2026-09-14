@@ -95,23 +95,15 @@ limited period from purchase (shown at checkout) after which unused credits
 expire; expired credits are not refunded. Credits have no cash value and are
 non-transferable.
 
-Payments are processed by Lemon Squeezy or Razorpay, depending on your
-region:
+Payments are processed by **Razorpay** through its hosted checkout. Razorpay
+is **not** the Merchant of Record; we handle billing support, refunds, and
+disputes for purchases from Thought2Build. Contact ${LEGAL_CONTACT_EMAIL}
+for help with a payment.
 
-- **Lemon Squeezy** acts as the Merchant of Record for its transactions —
-  it handles tax, chargebacks, and disputes directly.
-- **Razorpay** is **not** the Merchant of Record for its transactions — tax
-  and dispute liability sits with us as the account holder; if you have a
-  billing dispute on a Razorpay payment, contact us directly at
-  ${LEGAL_CONTACT_EMAIL} rather than disputing with your bank first, so we can
-  resolve it before it becomes a chargeback.
-
-Neither provider ever receives your card details from us — checkout is
-redirect-hosted by the payment provider. Refunds are handled per-provider as
-described above; if a refund or dispute claws back more value than remains on
-a credit pack, the difference is tracked as recoverable billing debt against
-your account rather than a negative credit balance, and is settled from your
-next purchase.
+We do not collect or store your card details. If a refund or lost dispute
+reverses more credit value than remains on a pack, the difference is tracked
+as recoverable billing debt against your account and settled from your next
+purchase. Your usable credit balance does not become negative.
 
 ## 8. Acceptable Use
 

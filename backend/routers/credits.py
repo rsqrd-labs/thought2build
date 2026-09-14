@@ -20,6 +20,8 @@ async def get_balance(
     db: AsyncSession = Depends(get_db),
 ) -> CreditBalance:
     balance = await credit_service.get_balance(db, user.id)
+    await db.commit()
+    await credit_service.invalidate(user.id)
     # Unrecovered payment-reversal debt (T-305): sum the still-owed amount across the
     # user's pending reversal debts. coalesce → 0 when there are no pending rows so
     # the response is always a non-negative int, never NULL.

@@ -247,7 +247,7 @@ def _link_paid_payload(
     if payment:
         base_payment.update(payment)
     base_link = {
-        "payment_link_id": "plink_live_1",
+        "payment_link_id": attempt.provider_checkout_id or "plink_live_1",
         "reference_id": str(attempt.id),
         "amount": attempt.price_cents,
         "currency": attempt.currency,
@@ -829,9 +829,10 @@ async def test_full_refund_revokes_all_remaining_once(
     assert p.credits_revoked == 200
     assert p.status == "refunded"
     assert p.refunded_item_amount_cents_processed == _PRICE_PAISE
-    assert await _refund_ledger(db_maker, pack_id) == [
-        (-200, f"refund:billing:{pack_id}:{_PRICE_PAISE}")
-    ]
+    rows = await _refund_ledger(db_maker, pack_id)
+    assert len(rows) == 1
+    assert rows[0][0] == -200
+    assert rows[0][1].startswith(f"refund:billing:{pack_id}:{_PRICE_PAISE}:")
     assert await _debt(db_maker, pack_id) is None
 
 
@@ -1010,7 +1011,7 @@ async def test_reprocessing_same_refund_row_is_idempotent(
 # ---------------------------------------------------------------------------
 
 
-async def test_missing_pack_with_proof_requeues_for_retry(
+async def test_missing_pack_with_proof_retains_reversal_evidence(
     session, db_maker, cleanup
 ) -> None:
     user = await _make_user(session, cleanup, balance=0)
@@ -1031,12 +1032,12 @@ async def test_missing_pack_with_proof_requeues_for_retry(
     await billing_worker.handle_razorpay_refund({}, str(wh.id))
 
     status, last_error = await _wh_status(db_maker, wh.id)
-    assert status == "received"
-    assert last_error == "pack_not_yet_granted"
+    assert status == "processed"
+    assert last_error == "refund_waiting_for_payment_grant"
     assert await _balance(db_maker, user.id) == 0
 
 
-async def test_missing_pack_expired_attempt_past_horizon_gives_up(
+async def test_missing_pack_expired_attempt_retains_reversal_evidence(
     session, db_maker, cleanup
 ) -> None:
     # Branch (b): the proven attempt has expired and >24h elapsed since the refund
@@ -1062,7 +1063,7 @@ async def test_missing_pack_expired_attempt_past_horizon_gives_up(
 
     status, last_error = await _wh_status(db_maker, wh.id)
     assert status == "processed"
-    assert last_error == "refund_pack_never_granted_attempt_expired"
+    assert last_error == "refund_waiting_for_payment_grant"
     assert await _balance(db_maker, user.id) == 0
 
 
@@ -1086,7 +1087,7 @@ async def test_missing_pack_without_proof_audited_no_unrelated_revoke(
 
     status, last_error = await _wh_status(db_maker, wh.id)
     assert status == "processed"
-    assert last_error == "refund_could_not_link_to_thought2build"
+    assert last_error == "refund_waiting_for_payment_grant"
     assert await _balance(db_maker, user_id) == 200  # untouched
     b = await _pack(db_maker, bystander_id)
     assert b.credits_revoked == 0

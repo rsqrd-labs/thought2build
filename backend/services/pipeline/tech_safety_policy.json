@@ -1,6 +1,6 @@
 {
   "policy_version": "tech-safety-v1",
-  "last_reviewed": "2026-08-05",
+  "last_reviewed": "2026-09-06",
   "max_age_days": 30,
   "blocked_severities": ["critical", "high", "unknown"],
   "near_eol_block_days": 730,

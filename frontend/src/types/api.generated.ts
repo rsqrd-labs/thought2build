@@ -1945,6 +1945,11 @@ export interface components {
          */
         AdminCorrectionRequest: {
             /**
+             * Checkout Ref
+             * @description Original checkout to settle; required for Razorpay
+             */
+            checkout_ref?: string | null;
+            /**
              * Credits
              * @description Credits to grant
              */
@@ -1968,7 +1973,7 @@ export interface components {
             /**
              * Provider
              * @description Billing provider of the corrected order
-             * @default lemonsqueezy
+             * @default razorpay
              * @enum {string}
              */
             provider: "lemonsqueezy" | "stripe" | "razorpay";
@@ -2031,14 +2036,35 @@ export interface components {
         BillingStatusResponse: {
             /**
              * Credits Added
-             * @description Credits added by this purchase
+             * @description Currently usable credits from this purchase
              */
             credits_added: number;
+            /**
+             * Credits Purchased
+             * @default 0
+             */
+            credits_purchased: number;
+            /**
+             * Credits Revoked
+             * @default 0
+             */
+            credits_revoked: number;
+            /**
+             * Debt Recovered
+             * @default 0
+             */
+            debt_recovered: number;
             /**
              * Expires At
              * @description UTC expiry of the purchased pack
              */
             expires_at?: string | null;
+            /**
+             * Settlement Status
+             * @default active
+             * @enum {string}
+             */
+            settlement_status: "active" | "consumed" | "expired" | "refunded" | "partially_refunded" | "disputed";
             /**
              * Status
              * @enum {string}
@@ -2775,7 +2801,7 @@ export interface components {
             /**
              * Currency
              * @description ISO 4217 currency code
-             * @default USD
+             * @default INR
              */
             currency: string;
             /**
@@ -2792,7 +2818,7 @@ export interface components {
             /**
              * Provider
              * @description The active payment provider these economics belong to
-             * @default lemonsqueezy
+             * @default razorpay
              */
             provider: string;
             /**

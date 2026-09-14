@@ -129,7 +129,7 @@ describe("Billing — checkout_ref polling", () => {
       expect(mockStatus).toHaveBeenCalledWith("ref-1"),
     )
     await waitFor(() =>
-      expect(screen.getByText(/200 credits added/i)).toBeInTheDocument(),
+      expect(screen.getByText(/200 credits available from this purchase/i)).toBeInTheDocument(),
     )
   })
 
@@ -170,7 +170,7 @@ describe("Billing — checkout_ref polling", () => {
     await user.click(retry)
 
     await waitFor(() => expect(mockStatus).toHaveBeenCalledTimes(2))
-    expect(await screen.findByText(/200 credits added/i)).toBeVisible()
+    expect(await screen.findByText(/200 credits available from this purchase/i)).toBeVisible()
   })
 
   it("lets the user dismiss a completed receipt without losing billing data", async () => {
@@ -184,7 +184,7 @@ describe("Billing — checkout_ref polling", () => {
     renderBilling("/billing?checkout_ref=ref-dismiss")
 
     await user.click(await screen.findByRole("button", { name: /stay on billing/i }))
-    expect(screen.queryByText(/200 credits added/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/200 credits available from this purchase/i)).not.toBeInTheDocument()
     expect(screen.getByRole("heading", { name: /available balance/i })).toBeVisible()
   })
 })
@@ -269,7 +269,7 @@ describe("Billing — checkout availability gate (issue #44)", () => {
       expect(mockStatus).toHaveBeenCalledWith("ref-inflight"),
     )
     await waitFor(() =>
-      expect(screen.getByText(/200 credits added/i)).toBeInTheDocument(),
+      expect(screen.getByText(/200 credits available from this purchase/i)).toBeInTheDocument(),
     )
   })
 })
@@ -340,5 +340,43 @@ describe("Billing — checkout navigation hardening", () => {
     await user.click(await screen.findByRole("button", { name: /buy 200 credits/i }))
     expect(await screen.findByText(/checkout could not open/i)).toBeVisible()
     expect(screen.getByText(/could not open secure checkout/i)).toBeVisible()
+  })
+})
+
+describe("Billing — settled payment receipt", () => {
+  it.each([
+    ["refunded", "Payment refunded"],
+    ["disputed", "Payment reversed after a dispute"],
+    ["expired", "This credit pack has expired"],
+  ] as const)("shows %s with zero usable credits", async (settlement_status, heading) => {
+    mockStatus.mockResolvedValue({
+      status: "completed", credits_added: 0, credits_purchased: 200,
+      settlement_status, expires_at: "2026-02-01T00:00:00Z",
+    })
+    renderBilling("/billing?checkout_ref=settled")
+    expect(await screen.findByRole("heading", { name: heading })).toBeVisible()
+    expect(screen.getByText(/0 credits available from this purchase/i)).toBeVisible()
+    expect(screen.queryByText(/200 credits added/i)).not.toBeInTheDocument()
+  })
+
+  it("explains debt recovery separately from usable purchase credits", async () => {
+    mockStatus.mockResolvedValue({
+      status: "completed", credits_added: 150, credits_purchased: 200,
+      debt_recovered: 50, settlement_status: "active",
+      expires_at: "2026-02-01T00:00:00Z",
+    })
+    renderBilling("/billing?checkout_ref=debt-repaid")
+    expect(await screen.findByText(/150 credits available from this purchase/i)).toBeVisible()
+    expect(screen.getByText(/50 credits were used to settle billing debt/i)).toBeVisible()
+  })
+
+  it("explains a partial payment reversal", async () => {
+    mockStatus.mockResolvedValue({
+      status: "completed", credits_added: 100,
+      settlement_status: "partially_refunded", expires_at: "2026-02-01T00:00:00Z",
+    })
+    renderBilling("/billing?checkout_ref=partially-reversed")
+    expect(await screen.findByText(/this purchase has been partially reversed/i)).toBeVisible()
+    expect(screen.getByText(/100 credits available from this purchase/i)).toBeVisible()
   })
 })

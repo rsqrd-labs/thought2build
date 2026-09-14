@@ -106,7 +106,10 @@ logger = structlog.get_logger(__name__)
 # instruction and the deterministic _architecture_diagram_signal structural
 # grader newly registered in artifact_validator.py's _STRUCTURAL_SECTIONS).
 # No heading added/removed, so SECTION_CONTRACTS["plan"] is unchanged.
-ASDD_PROMPT_VERSION = "asdd-v2.11.0"
+# v2.11.1 — re-reviewed the existing technology denylist and refreshed its
+# policy/prompt review dates. Prompt content is unchanged; the prompt-eval gate
+# requires a version bump for every change under backend/prompts/.
+ASDD_PROMPT_VERSION = "asdd-v2.11.1"
 STAGE_PROMPT_VERSIONS: dict[str, str] = {
     # spec-v5: audit M8 — the clarification Q&A block is now fenced with
     # wrap_untrusted_content instead of rendering user-typed answers raw in

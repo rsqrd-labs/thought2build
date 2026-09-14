@@ -57,7 +57,6 @@ describe("LegalPrivacy", () => {
     for (const provider of [
       "Anthropic",
       "OpenAI",
-      "Lemon Squeezy",
       "Razorpay",
       "GitHub",
       "Brave Search",

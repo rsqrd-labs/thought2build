@@ -213,13 +213,13 @@ async def test_get_balance_returns_user_balance(svc: CreditService) -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_balance_uses_cache_on_second_call(svc: CreditService) -> None:
+async def test_get_balance_ignores_stale_redis_value(svc: CreditService) -> None:
     user_id = uuid4()
     redis = svc._redis
     assert isinstance(redis, _FakeRedis)
     redis._store[f"credits:{user_id}"] = "99"
     db = _FakeDB()
-    assert await svc.get_balance(db, user_id) == 99
+    assert await svc.get_balance(db, user_id) == 0
     assert not db.added
 
 

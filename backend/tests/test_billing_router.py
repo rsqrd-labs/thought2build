@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import pytest
@@ -38,8 +38,17 @@ from database import get_db
 from main import create_app
 from middleware.auth import get_current_user
 from models import BillingCheckoutAttempt, BillingCreditPack, User
-from services.lemonsqueezy_service import LemonSqueezyError, lemonsqueezy_service
+from services.credit_service import credit_service
+from services.lemonsqueezy_service import lemonsqueezy_service
 from services.razorpay_service import RazorpayError, razorpay_service
+
+
+@pytest.fixture(autouse=True)
+def mock_balance_sweep(monkeypatch):
+    # Real persistence/expiry is exercised in test_payment_settlement_regressions.
+    monkeypatch.setattr(credit_service, "get_balance", AsyncMock(return_value=200))
+    monkeypatch.setattr(credit_service, "invalidate", AsyncMock())
+
 
 _USER_ID = uuid4()
 _USER = User(
@@ -270,6 +279,9 @@ def _active_pack() -> BillingCreditPack:
         price_cents=900,
         currency="USD",
         paid_item_amount_cents=900,
+        credits_revoked=0,
+        credits_debt_recovered=0,
+        refunded_item_amount_cents_processed=0,
         status="active",
         purchased_at=now,
         expires_at=now + timedelta(days=30),
@@ -295,7 +307,7 @@ async def test_package_returns_lemon_config() -> None:
         "price_cents": 900,
         "validity_days": 30,
         "currency": "USD",
-        "enabled": True,
+        "enabled": False,
         "provider": "lemonsqueezy",
     }
 
@@ -416,11 +428,11 @@ async def test_checkout_attempt_lifecycle_created_then_provider_created() -> Non
         captured["nonce"] = checkout_nonce
         captured["nonce_hash"] = attempt.checkout_nonce_hash
         captured["checkout_ref"] = attempt.checkout_ref
-        return "co_123", "https://pay.lemonsqueezy.com/abc"
+        return "co_123", "https://rzp.io/i/abc"
 
-    with _Patches(_enable_lemon()):
+    with _Patches(_enable_razorpay()):
         with patch.object(
-            lemonsqueezy_service, "create_checkout", _fake_create_checkout
+            razorpay_service, "create_payment_link", _fake_create_checkout
         ):
             transport = ASGITransport(app=app)
             async with AsyncClient(
@@ -430,7 +442,7 @@ async def test_checkout_attempt_lifecycle_created_then_provider_created() -> Non
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["checkout_url"] == "https://pay.lemonsqueezy.com/abc"
+    assert body["checkout_url"] == "https://rzp.io/i/abc"
     checkout_ref = body["checkout_ref"]
     assert checkout_ref and checkout_ref == captured["checkout_ref"]
 
@@ -451,21 +463,21 @@ async def test_checkout_attempt_lifecycle_created_then_provider_created() -> Non
 
     attempt = session.added[0]
     assert isinstance(attempt, BillingCheckoutAttempt)
-    assert attempt.provider == "lemonsqueezy"
+    assert attempt.provider == "razorpay"
     assert attempt.provider_checkout_id == "co_123"
     assert attempt.status == "provider_created"
 
 
 @pytest.mark.asyncio
-async def test_checkout_lemon_failure_marks_attempt_failed_502() -> None:
+async def test_checkout_provider_failure_marks_attempt_failed_502() -> None:
     session = _FakeSession()
     app = _make_app(session)
 
     async def _boom(attempt, user, *, checkout_nonce):  # type: ignore[no-untyped-def]
-        raise LemonSqueezyError("provider down")
+        raise RazorpayError("provider down")
 
-    with _Patches(_enable_lemon()):
-        with patch.object(lemonsqueezy_service, "create_checkout", _boom):
+    with _Patches(_enable_razorpay()):
+        with patch.object(razorpay_service, "create_payment_link", _boom):
             transport = ASGITransport(app=app)
             async with AsyncClient(
                 transport=transport, base_url="http://test"
@@ -486,10 +498,10 @@ async def test_checkout_orphaned_commit_failure_502_no_url() -> None:
     app = _make_app(session)
 
     async def _ok(attempt, user, *, checkout_nonce):  # type: ignore[no-untyped-def]
-        return "co_orphan", "https://pay.lemonsqueezy.com/secret-url"
+        return "co_orphan", "https://rzp.io/i/secret-url"
 
-    with _Patches(_enable_lemon()):
-        with patch.object(lemonsqueezy_service, "create_checkout", _ok):
+    with _Patches(_enable_razorpay()):
+        with patch.object(razorpay_service, "create_payment_link", _ok):
             transport = ASGITransport(app=app)
             async with AsyncClient(
                 transport=transport, base_url="http://test"
@@ -508,18 +520,18 @@ async def test_checkout_rate_limit_sixth_returns_429() -> None:
     app = _make_app(session, redis=_CountingRedis())
 
     async def _ok(attempt, user, *, checkout_nonce):  # type: ignore[no-untyped-def]
-        return "co_x", "https://pay.lemonsqueezy.com/x"
+        return "co_x", "https://rzp.io/i/x"
 
     # The rate-limit middleware needs decodable claims to scope per-user; the
     # CSRF middleware uses its own (unpatched) decoder, so it still sees no
     # session for the fake token and lets the request through.
-    with _Patches(_enable_lemon()):
+    with _Patches(_enable_razorpay()):
         with (
             patch(
                 "middleware.rate_limit.decode_access_token_claims",
                 return_value={"sub": str(_USER_ID)},
             ),
-            patch.object(lemonsqueezy_service, "create_checkout", _ok),
+            patch.object(razorpay_service, "create_payment_link", _ok),
         ):
             transport = ASGITransport(app=app)
             async with AsyncClient(
@@ -545,12 +557,12 @@ async def test_checkout_created_metric_increments() -> None:
     app = _make_app(session)
 
     async def _ok(attempt, user, *, checkout_nonce):  # type: ignore[no-untyped-def]
-        return "co_x", "https://pay.lemonsqueezy.com/x"
+        return "co_x", "https://rzp.io/i/x"
 
-    created = BILLING_CHECKOUT_CREATED.labels(provider="lemonsqueezy")
+    created = BILLING_CHECKOUT_CREATED.labels(provider="razorpay")
     before = created._value.get()
-    with _Patches(_enable_lemon()):
-        with patch.object(lemonsqueezy_service, "create_checkout", _ok):
+    with _Patches(_enable_razorpay()):
+        with patch.object(razorpay_service, "create_payment_link", _ok):
             transport = ASGITransport(app=app)
             async with AsyncClient(
                 transport=transport, base_url="http://test"
@@ -694,7 +706,7 @@ async def test_status_checkout_ref_completed_returns_200() -> None:
     assert body["credits_added"] == 200
     # First-touch telemetry was stamped + committed.
     assert attempt.success_redirect_seen_at is not None
-    assert session.commit_count == 1
+    assert session.commit_count == 2
 
 
 @pytest.mark.asyncio

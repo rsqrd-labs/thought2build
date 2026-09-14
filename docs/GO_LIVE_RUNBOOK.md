@@ -498,7 +498,7 @@ the site is live.
 
 ---
 
-## Phase 11 — Payments: confirmed off, plan for next week
+## Phase 11 — Payments: off until verified
 
 You're launching with:
 ```
@@ -510,37 +510,15 @@ generation works — but the "Buy credits" button and checkout are inert.
 checkout accordingly. Nothing about this is fragile — you can leave it off
 indefinitely with no side effects.
 
-**When you're ready to turn payments on (next week or later):**
+Before enabling Razorpay purchases, complete the
+[payment launch verification](PAYMENT_LAUNCH_VERIFICATION.md). This includes
+migration 0046, real provider test-mode payment and refund exercises, worker and
+reconciliation checks, and the required dispute webhook subscriptions. An HTTP
+200 for a sample webhook alone does not verify a credit grant.
 
-1. Set up Razorpay per the "Razorpay" section of the handbook (Payment
-   Links product, webhook pointed at
-   `https://api.thought2build.com/billing/webhook/razorpay` — note this is a
-   **different path** from Lemon Squeezy's; Razorpay has its own webhook
-   route).
-2. In Railway, fill in `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`,
-   `RAZORPAY_WEBHOOK_SECRET`,
-   `RAZORPAY_SUCCESS_URL=https://thought2build.com/billing`, and confirm
-   `RAZORPAY_CURRENCY`/`RAZORPAY_PRICE_CENTS`/`RAZORPAY_CREDITS_PER_PURCHASE`/
-   `RAZORPAY_CREDIT_VALIDITY_DAYS` match the pack you want to sell (defaults
-   in `.env.example` are `INR`/`154900`/`200`/`30`, i.e. ₹1549 for 200
-   credits — change if that's not your pricing). Note ₹1549 is **not** a
-   currency conversion of the $15.00 Lemon price: Razorpay is not a Merchant
-   of Record, so 18% GST comes off this gross on your side, netting ~₹1313
-   ≈ $14.9. If you change the USD price, re-derive the INR **gross**.
-3. **`RAZORPAY_KEY_ID` must start with `rzp_live_`, not `rzp_test_`, in
-   production** — this is the one that has bitten people before. Razorpay
-   has no separate "test mode" flag like Lemon Squeezy; the key prefix
-   *is* the environment, and the app refuses to start in production with a
-   test key configured.
-4. Also confirm `RAZORPAY_CHECKOUT_TTL_MINUTES` is at least `16` — Razorpay
-   rejects shorter payment-link expiries, and this is enforced at startup
-   too.
-5. Send a **test webhook delivery** from Razorpay's dashboard first and
-   confirm it returns `200` before flipping the switch for real users.
-6. Only then set `PAYMENTS_ENABLED=true` (and `PAYMENT_PROVIDER=razorpay`,
-   already set) and redeploy.
-7. Buy one credit pack yourself with a real card first, confirm credits land
-   in your account, before telling anyone else it's live.
+Keep `PAYMENT_PROVIDER=razorpay` and `PAYMENTS_ENABLED=false` during deployment.
+Production requires live Razorpay credentials; use a separate staging environment
+for test keys. Enable purchases only after reviewing those verification results.
 
 ---
 
@@ -598,7 +576,7 @@ set and valid (test the key directly against the provider's API if unsure).
 **Billing-related errors even though payments are off:** shouldn't happen —
 `PAYMENTS_ENABLED=false` disables checkout entirely — but if you see any,
 confirm `PAYMENT_PROVIDER` is set to a valid value (`razorpay` or
-`lemonsqueezy`); production refuses to boot on an empty/invalid value even
+`razorpay`); production refuses to boot on an empty/invalid value even
 while disabled.
 
 **Rolling back:** Railway keeps previous deployments — go to **Deployments**

@@ -9,11 +9,13 @@ from models.billing_admin_correction import BillingAdminCorrection  # noqa: E402
 from models.billing_checkout_attempt import BillingCheckoutAttempt  # noqa: E402
 from models.billing_credit_debt import BillingCreditDebt  # noqa: E402
 from models.billing_credit_pack import BillingCreditPack  # noqa: E402
+from models.billing_dispute import BillingDispute  # noqa: E402
 from models.billing_reconciliation_cursor import (  # noqa: E402
     BillingReconciliationCursor,
 )
 from models.billing_webhook_event import BillingWebhookEvent  # noqa: E402
 from models.credit_ledger import CreditLedger  # noqa: E402
+from models.credit_pack_allocation import CreditPackAllocation  # noqa: E402
 from models.eval_result import EvalResult  # noqa: E402
 from models.github_installation import GitHubInstallation  # noqa: E402
 from models.github_webhook_event import GitHubWebhookEvent  # noqa: E402
@@ -42,9 +44,11 @@ __all__ = [
     "BillingCheckoutAttempt",
     "BillingCreditDebt",
     "BillingCreditPack",
+    "BillingDispute",
     "BillingReconciliationCursor",
     "BillingWebhookEvent",
     "CreditLedger",
+    "CreditPackAllocation",
     "EvalResult",
     "GitHubInstallation",
     "GitHubWebhookEvent",

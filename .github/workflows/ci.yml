@@ -570,7 +570,7 @@ jobs:
         with:
           # pnpm 9/10 use npm's retired audit endpoint and now fail with HTTP
           # 410 before typecheck/tests. pnpm 11 uses the supported bulk API.
-          version: 11.13.0
+          version: 11.13.1
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

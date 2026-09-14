@@ -735,22 +735,13 @@ class Settings(BaseSettings):
     # Upper bound on provider API calls per reconcile run (bounds lane 2, T-301).
     lemonsqueezy_reconcile_max_calls_per_run: int = 200
 
-    # Payment gateway feature flags (issue #44). Exactly ONE gateway is active
-    # at a time, selected by ``payment_provider``; ``payments_enabled`` is the
-    # master kill switch. Default False — the product is not live yet, so
-    # checkout ships OFF until explicitly enabled. The flags gate checkout
-    # creation and package display ONLY (see ``billing_checkout_enabled``):
-    # both providers' webhook routes stay registered and keep processing
-    # regardless, so refunds/disputes for the inactive provider's old orders
-    # still settle after a switch. Flipping provider = env change + restart,
-    # same as every other flag here; production validates that the selector
-    # names a known gateway and that an enabled deployment's active provider
-    # is fully configured.
+    # New checkout uses Razorpay only and ships disabled. The switch gates new
+    # checkout, while signed events and recovery continue settling existing money.
+    # Legacy provider credentials are retained only for historical settlement.
     payments_enabled: bool = False
-    payment_provider: str = "lemonsqueezy"  # "lemonsqueezy" | "razorpay"
+    payment_provider: str = "razorpay"
 
-    # Razorpay billing (issue #44) — the INR gateway alternative to Lemon
-    # Squeezy, via hosted Payment Links (no SDK, no frontend checkout changes).
+    # Razorpay billing via hosted Payment Links (async HTTP, no SDK).
     # Leave the key id / key secret blank to keep it unconfigured
     # (``razorpay_enabled`` false). When configured — active or not, because
     # its webhook route always processes — production requires a complete LIVE
@@ -781,6 +772,8 @@ class Settings(BaseSettings):
     razorpay_api_base: str = "https://api.razorpay.com"
     # Upper bound on provider API calls per reconcile run (bounds lane 2).
     razorpay_reconcile_max_calls_per_run: int = 200
+    razorpay_recovery_attempts_per_run: int = 50
+    razorpay_reconcile_lookback_days: int = 180
 
     # Comma-separated allowlist of admin emails authorised to issue billing admin
     # corrections (T-302). The codebase has no role column, so this allowlist is
@@ -971,8 +964,6 @@ class Settings(BaseSettings):
         """
         if not self.payments_enabled:
             return False
-        if self.payment_provider == "lemonsqueezy":
-            return self.lemonsqueezy_enabled
         if self.payment_provider == "razorpay":
             return self.razorpay_enabled
         return False
@@ -1131,9 +1122,9 @@ def validate_production_settings() -> None:
     # so production refuses to start instead. And when the master switch is on,
     # the ACTIVE provider must be fully configured — otherwise every checkout
     # 503s at runtime while payments read as enabled.
-    if settings.payment_provider not in ("lemonsqueezy", "razorpay"):
+    if settings.payment_provider != "razorpay":
         errors.append(
-            "PAYMENT_PROVIDER must be one of 'lemonsqueezy' or 'razorpay' "
+            "PAYMENT_PROVIDER must be 'razorpay' for new purchases "
             f"(got {settings.payment_provider!r}); a typo would silently "
             "disable billing."
         )
@@ -1155,6 +1146,12 @@ def validate_production_settings() -> None:
     # Razorpay (one of the two blank) is "disabled" and intentionally fails
     # to-disabled.
     if settings.razorpay_enabled:
+        if settings.razorpay_recovery_attempts_per_run <= 0:
+            errors.append("RAZORPAY_RECOVERY_ATTEMPTS_PER_RUN must be positive")
+        if settings.razorpay_reconcile_max_calls_per_run <= 0:
+            errors.append("RAZORPAY_RECONCILE_MAX_CALLS_PER_RUN must be positive")
+        if settings.razorpay_reconcile_lookback_days < 30:
+            errors.append("RAZORPAY_RECONCILE_LOOKBACK_DAYS must be at least 30")
         if not settings.razorpay_webhook_secret.strip():
             errors.append(
                 "RAZORPAY_WEBHOOK_SECRET must be set when Razorpay billing is "

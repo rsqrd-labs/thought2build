@@ -11,7 +11,7 @@ import {
   getApiErrorMessage,
   getCredits,
 } from "../services/api"
-import type { BillingCreditPack, BillingPackage } from "../types/billing"
+import type { BillingCreditPack, BillingPackage, BillingStatusResponse } from "../types/billing"
 import { billingAlert } from "../utils/errorPresentation"
 
 type LoadState = "loading" | "ready" | "error"
@@ -126,6 +126,7 @@ interface PaymentStatusPanelProps {
   status: PollingStatus
   creditsAdded: number | null
   expiresAt: string | null
+  settlement: BillingStatusResponse | null
   onRetry: () => void
   onDismiss: () => void
 }
@@ -134,6 +135,7 @@ function PaymentStatusPanel({
   status,
   creditsAdded,
   expiresAt,
+  settlement,
   onRetry,
   onDismiss,
 }: PaymentStatusPanelProps) {
@@ -178,10 +180,22 @@ function PaymentStatusPanel({
           </>
         ) : (
           <>
-            <h2>{creditsAdded ?? 0} credits added</h2>
-            <p>
-              Your balance is ready. These credits expire {formatDate(expiresAt)}.
+            <h2>{settlement?.settlement_status === "refunded"
+              ? "Payment refunded"
+              : settlement?.settlement_status === "disputed"
+                ? "Payment reversed after a dispute"
+                : settlement?.settlement_status === "expired"
+                  ? "This credit pack has expired"
+                  : "Payment confirmed"}</h2>
+            <p>{creditsAdded ?? 0} credits available from this purchase.
+              {(creditsAdded ?? 0) > 0 && ` These credits expire ${formatDate(expiresAt)}.`}
             </p>
+            {(settlement?.debt_recovered ?? 0) > 0 && (
+              <p>{settlement?.debt_recovered} credits were used to settle billing debt.</p>
+            )}
+            {settlement?.settlement_status === "partially_refunded" && (
+              <p>This purchase has been partially reversed. Your available credits reflect that reversal.</p>
+            )}
           </>
         )}
       </div>
@@ -240,6 +254,7 @@ export default function Billing() {
   )
   const [creditsAdded, setCreditsAdded] = useState<number | null>(null)
   const [completedExpiresAt, setCompletedExpiresAt] = useState<string | null>(null)
+  const [settlement, setSettlement] = useState<BillingStatusResponse | null>(null)
   const [balanceJustLanded, setBalanceJustLanded] = useState(false)
 
   const loadBillingData = useCallback(async (showLoading = true) => {
@@ -270,6 +285,7 @@ export default function Billing() {
       setPollingStatus("idle")
       setCreditsAdded(null)
       setCompletedExpiresAt(null)
+      setSettlement(null)
       return
     }
 
@@ -282,6 +298,7 @@ export default function Billing() {
     setPollingStatus("processing")
     setCreditsAdded(null)
     setCompletedExpiresAt(null)
+    setSettlement(null)
 
     function stopPolling() {
       window.clearInterval(intervalId)
@@ -301,6 +318,7 @@ export default function Billing() {
           setPollingStatus("completed")
           setCreditsAdded(result.credits_added)
           setCompletedExpiresAt(result.expires_at)
+          setSettlement(result)
           setBalanceJustLanded(true)
           void loadBillingData(false)
         } else if (elapsed >= PAYMENT_POLL_TIMEOUT_MS) {
@@ -407,6 +425,7 @@ export default function Billing() {
           status={pollingStatus}
           creditsAdded={creditsAdded}
           expiresAt={completedExpiresAt}
+          settlement={settlement}
           onRetry={retryPaymentStatus}
           onDismiss={dismissPaymentStatus}
         />

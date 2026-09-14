@@ -79,11 +79,10 @@ the Service, with the following categories of recipients:
   your idea, clarification answers, and prior stage content to the AI
   providers selected by Thought2Build — Anthropic, OpenAI, or Google — as context
   for generation. Provider selection is an internal service operation.
-- **Payment processors.** To process credit purchases, we share your email
-  address, and no other billing information, with our payment processor.
-  Depending on your region, this is Lemon Squeezy or Razorpay. Lemon Squeezy
-  acts as Merchant of Record for its transactions; Razorpay does not (see our
-  Terms of Service for what this means for billing disputes).
+- **Payment processor.** Razorpay hosts checkout and processes credit purchases.
+  We send your email address, purchase amount, currency, and account and
+  checkout identifiers needed to associate the payment with your account.
+  We do not collect or store your payment card details.
 - **GitHub.** If you connect a repository, we synchronize the content you
   export — specification, plan, harness, and task files, along with
   generated issues and pull requests — to the repository you designate.
