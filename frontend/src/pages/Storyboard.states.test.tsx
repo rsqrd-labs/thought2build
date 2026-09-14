@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react"
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { MemoryRouter, Route, Routes } from "react-router"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -150,7 +150,14 @@ describe("Storyboard owner states", () => {
     api.getStoryboard.mockResolvedValue(storyboard())
     renderPage()
     expect(await screen.findByRole("button", { name: "Present deck" })).toBeInTheDocument()
-    expect(document.title).toBe("Launch Storyboard — Thought2Build Storyboard")
+    // The title is set from a passive effect, which is not guaranteed to have
+    // flushed at the moment `findByRole` resolves — the ready DOM can commit
+    // first, leaving the loading-state title ("Storyboard — Thought2Build")
+    // still installed. Observed as an intermittent CI failure; locally the
+    // effect happened to win the race every time.
+    await waitFor(() =>
+      expect(document.title).toBe("Launch Storyboard — Thought2Build Storyboard"),
+    )
 
     fireEvent.click(screen.getByRole("button", { name: "Toggle downloads" }))
     expect(screen.getByText("Download menu")).toBeInTheDocument()
