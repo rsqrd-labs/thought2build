@@ -95,6 +95,10 @@ the Service, with the following categories of recipients:
   information — including your IP address, browser user agent, and portions
   of your content — with credentials and secrets automatically redacted
   before transmission.
+- **Website analytics.** We use Vercel Web Analytics to count visits to our
+  website and app. It sets no cookies and records the page visited (with
+  workspace identifiers and share links removed), the referring site, and
+  your approximate country, browser, and device type.
 - **Hosting and infrastructure providers.** We use third-party cloud
   infrastructure to host and operate the Service.
 

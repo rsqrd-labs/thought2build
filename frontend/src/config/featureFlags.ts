@@ -22,10 +22,14 @@
  * the construction-verified badge and handoff panel render data-driven on
  * `workspace.mode === "demo_day"`, so a workspace already created in Demo Day
  * mode keeps displaying its handoff UI even if this build flag is off.
+ *
+ * `webAnalytics` injects Vercel Web Analytics (see services/analytics.ts). Only
+ * the exact literal `"true"` opts in, so dev, CI and e2e builds ship no script.
  */
 export const featureFlags = {
   brandedLoaders: import.meta.env.VITE_BRANDED_LOADERS !== "false",
   demoDayMode: import.meta.env.VITE_DEMO_DAY_MODE === "true",
+  webAnalytics: import.meta.env.VITE_ANALYTICS_ENABLED === "true",
 } as const
 
 export type FeatureFlag = keyof typeof featureFlags

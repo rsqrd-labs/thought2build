@@ -62,6 +62,7 @@ describe("LegalPrivacy", () => {
       "Brave Search",
       "Sentry",
       "Langfuse",
+      "Vercel Web Analytics",
     ]) {
       expect(text).toContain(provider)
     }
