@@ -20,4 +20,4 @@ export const LEGAL_VENUE_CITY = "[CITY]"
 // Replace with a real support/legal contact before any production launch.
 export const LEGAL_CONTACT_EMAIL = "legal@thought2build.example"
 
-export const LEGAL_LAST_UPDATED = "2026-07-11"
+export const LEGAL_LAST_UPDATED = "2026-09-29"
